@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="xterm.min.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
+  #term { height: 100%; padding: 4px 0 0 6px; box-sizing: border-box; }
+  .xterm .xterm-viewport { background-color: #1e1e1e !important; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="xterm.min.js"></script>
+<script src="xterm-addon-fit.min.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+const term = new Terminal({
+  fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+  fontSize: 13,
+  cursorBlink: true,
+  macOptionIsMeta: true,
+  scrollback: 8000,
+  allowProposedApi: true,
+  theme: {
+    background: "#1e1e1e",
+    foreground: "#d4d4d4",
+    cursor: "#aeafad",
+    selectionBackground: "#264f78",
+    black: "#1e1e1e", red: "#f44747", green: "#6a9955", yellow: "#dcdcaa",
+    blue: "#569cd6", magenta: "#c586c0", cyan: "#4ec9b0", white: "#d4d4d4",
+    brightBlack: "#808080", brightRed: "#f48771", brightGreen: "#b5cea8",
+    brightYellow: "#e8b339", brightBlue: "#4fc1ff", brightMagenta: "#d670d6",
+    brightCyan: "#56b6c2", brightWhite: "#ffffff"
+  }
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById("term"));
+fit.fit();
+term.focus();
+
+new QWebChannel(qt.webChannelTransport, (channel) => {
+  const bridge = channel.objects.bridge;
+  term.onData(d => bridge.send_input(d));
+  bridge.output.connect(b64 => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    term.write(bytes);
+  });
+  bridge.cleared.connect(() => term.reset());
+  const sendSize = () => { fit.fit(); bridge.resized(term.cols, term.rows); };
+  new ResizeObserver(sendSize).observe(document.getElementById("term"));
+  window.addEventListener("resize", sendSize);
+  sendSize();
+  window.addEventListener("focus", () => term.focus());
+});
+</script>
+</body>
+</html>

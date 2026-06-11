@@ -1,0 +1,8 @@
+# entorno
+.venv/
+__pycache__/
+*.pyc
+
+# sistema
+.DS_Store
+nohup.out
