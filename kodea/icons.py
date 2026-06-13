@@ -1,5 +1,9 @@
-"""Iconos generados por código: archivos por tipo, carpetas y logo de la app."""
+"""Iconos de la app: logo (logo.png) e iconos generados por código (archivos,
+carpetas, servidor)."""
 from __future__ import annotations
+
+import os
+import sys
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import (
@@ -11,6 +15,16 @@ from PySide6.QtGui import (
     QPainterPath,
     QPixmap,
 )
+
+
+def _assets_dir() -> str:
+    """Carpeta de assets, también cuando la app va empaquetada (PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, "kodea", "assets")  # type: ignore[attr-defined]
+    return os.path.join(os.path.dirname(__file__), "assets")
+
+
+LOGO_PATH = os.path.join(_assets_dir(), "logo.png")
 
 # color por extensión (paleta tipo GitHub/Seti)
 EXT_COLORS = {
@@ -131,7 +145,29 @@ def folder_icon(open_: bool = False) -> QIcon:
     return _cache[key]
 
 
-def app_pixmap(size: int = 256) -> QPixmap:
+def server_icon() -> QIcon:
+    """Icono de servidor/VPS para el botón de conexión remota."""
+    if "server" not in _cache:
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QColor("#cfe3f2"))
+        p.setBrush(QColor("#3a5a72"))
+        for y in (6, 17):  # dos «racks» apilados
+            p.drawRoundedRect(QRectF(5, y, 22, 9), 2, 2)
+            p.setBrush(QColor("#5fd38d"))  # led de estado
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(QRectF(8, y + 3, 3, 3))
+            p.setPen(QColor("#cfe3f2"))
+            p.setBrush(QColor("#3a5a72"))
+        p.end()
+        _cache["server"] = QIcon(pm)
+    return _cache["server"]
+
+
+def _drawn_app_pixmap(size: int) -> QPixmap:
+    """Logo de respaldo dibujado por código (si falta logo.png)."""
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -153,7 +189,34 @@ def app_pixmap(size: int = 256) -> QPixmap:
     return pm
 
 
+def app_pixmap(size: int = 256) -> QPixmap:
+    """Logo de la app (logo.png) escalado a `size`; si no existe, el dibujado."""
+    pm = QPixmap(LOGO_PATH)
+    if pm.isNull():
+        return _drawn_app_pixmap(size)
+    return pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def app_pixmap_round(size: int = 88) -> QPixmap:
+    """Logo recortado en círculo, para mostrarlo sobre paneles oscuros sin que
+    se vean las esquinas del PNG."""
+    src = app_pixmap(size)
+    out = QPixmap(size, size)
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing)
+    path = QPainterPath()
+    path.addEllipse(QRectF(0, 0, size, size))
+    p.setClipPath(path)
+    x = (size - src.width()) // 2
+    y = (size - src.height()) // 2
+    p.drawPixmap(x, y, src)
+    p.end()
+    return out
+
+
 def app_icon() -> QIcon:
     if "app" not in _cache:
-        _cache["app"] = QIcon(app_pixmap())
+        pm = QPixmap(LOGO_PATH)
+        _cache["app"] = QIcon(pm) if not pm.isNull() else QIcon(_drawn_app_pixmap(256))
     return _cache["app"]

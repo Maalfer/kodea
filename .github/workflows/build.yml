@@ -1,0 +1,164 @@
+name: Build installers
+
+# Compila Kodea para Windows, macOS y Linux.
+#   - En cada push/PR: genera los instaladores y los sube como artefactos.
+#   - Al empujar un tag v* (p. ej. v1.0.0): además publica una Release con ellos.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- versión
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------- Windows
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+      - name: Generate icons
+        run: python build/make_icons.py
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm kodea.spec
+      - name: Build installer (Inno Setup)
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ needs.version.outputs.version }} installer\kodea.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kodea-windows
+          path: installer/Output/Kodea-Setup-*.exe
+
+  # ------------------------------------------------------------------ macOS
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+      - name: Generate icons
+        run: python build/make_icons.py
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm kodea.spec
+      - name: Build .dmg
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          STAGE="$(mktemp -d)"
+          cp -R "dist/Kodea.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Kodea" -srcfolder "$STAGE" -ov -format UDZO \
+            "dist/Kodea-${VERSION}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kodea-macos
+          path: dist/Kodea-*.dmg
+
+  # ------------------------------------------------------------------ Linux
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libnss3 libxcomposite1 libxdamage1 \
+            libxrandr2 libxtst6 libgbm1 libasound2 dpkg-dev fakeroot
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+      - name: Generate icons
+        run: python build/make_icons.py
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm kodea.spec
+      - name: Build .deb
+        run: VERSION="${{ needs.version.outputs.version }}" bash packaging/build_deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kodea-linux
+          path: dist/kodea_*.deb
+
+  # ----------------------------------------------------------------- Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+
+  # ------------------------------------------------- Repositorio APT (Pages)
+  apt-repo:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # conserva las versiones ya publicadas (si la rama gh-pages existe)
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: apt-repo
+        continue-on-error: true
+      - name: Download .deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kodea-linux
+          path: incoming
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev apt-utils
+      - name: Build APT repository
+        run: bash packaging/build_apt_repo.sh
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./apt-repo
+          publish_branch: gh-pages
+          keep_files: false

@@ -6,3 +6,13 @@ __pycache__/
 # sistema
 .DS_Store
 nohup.out
+
+# artefactos de build (se generan en CI con build/make_icons.py y PyInstaller)
+build/*.png
+build/*.ico
+build/*.icns
+build/Kodea.iconset/
+dist/
+installer/Output/
+*.deb
+*.dmg

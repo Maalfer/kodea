@@ -120,7 +120,7 @@ class WelcomeWidget(QWidget):
         outer.addStretch(2)
 
         logo = QLabel()
-        logo.setPixmap(icons.app_pixmap(88))
+        logo.setPixmap(icons.app_pixmap_round(96))
         logo.setAlignment(Qt.AlignCenter)
         outer.addWidget(logo)
 
@@ -143,6 +143,7 @@ class WelcomeWidget(QWidget):
         btn_row.addWidget(b_open)
         btn_row.addSpacing(12)
         b_conn = QPushButton("  Conectar a VPS")
+        b_conn.setIcon(icons.server_icon())
         b_conn.setMinimumWidth(170)
         b_conn.clicked.connect(connect_cb)
         btn_row.addWidget(b_conn)

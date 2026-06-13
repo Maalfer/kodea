@@ -1,24 +1,23 @@
-"""Terminal del sistema embebida (xterm.js + pty).
+"""Terminal del sistema embebida (xterm.js + pseudo-terminal).
 
-El panel es una terminal completa al 100%: tu shell de login (zsh con tu
-prompt, tu PATH y tu configuración) corriendo en un pseudo-terminal. Al abrir
-un proyecto o conectar a un VPS, Kodea teclea y ejecuta el comando `claude`
-dentro de esa shell; cuando claude termina (o pulsas Ctrl+C) sigues en tu
-terminal normal y puedes ejecutar lo que quieras.
+El panel es una terminal completa al 100%: tu shell de login (zsh/bash en
+macOS y Linux, PowerShell en Windows, con tu prompt, tu PATH y tu
+configuración) corriendo en un pseudo-terminal. Al abrir un proyecto o
+conectar a un VPS, Kodea teclea y ejecuta el comando `claude` dentro de esa
+shell; cuando claude termina (o pulsas Ctrl+C) sigues en tu terminal normal y
+puedes ejecutar lo que quieras.
+
+El pty concreto (ConPTY en Windows, ``pty.fork`` en Unix) lo resuelve
+``kodea.pty_backend``; aquí solo orquestamos la vista web y el contexto.
 """
 from __future__ import annotations
 
 import base64
-import fcntl
 import os
-import pty
-import shlex
-import signal
-import struct
-import termios
+import sys
 import time
 
-from PySide6.QtCore import QObject, QSocketNotifier, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
@@ -30,11 +29,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .claude_cmd import claude_command, log
+from .claude_cmd import claude_command, format_local_command, log, write_remote_launcher
 from .connections import Connection
+from .pty_backend import default_shell, make_backend, submit_key
 
-ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
-SCRIPT_PATH = os.path.expanduser("~/.kodea/claude-vps.sh")
+
+def _assets_dir() -> str:
+    """Carpeta de assets web, también cuando la app va empaquetada (PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, "kodea", "assets")  # type: ignore[attr-defined]
+    return os.path.join(os.path.dirname(__file__), "assets")
+
+
+ASSETS_DIR = _assets_dir()
 
 PERMISSION_MODES = [
     ("Aceptar ediciones", "acceptEdits"),
@@ -64,15 +71,13 @@ class TermBridge(QObject):
 
 
 class TerminalWidget(QWebEngineView):
-    """Emulador de terminal (xterm.js) conectado a un pty con tu shell."""
+    """Emulador de terminal (xterm.js) conectado a la shell del sistema."""
 
     process_finished = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.pid: int | None = None
-        self.fd: int | None = None
-        self._notifier: QSocketNotifier | None = None
+        self._backend = None
         self._cols, self._rows = 80, 24
         self._page_ready = False
         self._pending_start: tuple | None = None
@@ -96,7 +101,7 @@ class TerminalWidget(QWebEngineView):
             self.start_shell(*args)
 
     def start_shell(self, cwd: str, initial_cmd: str | None = None):
-        """Abre el shell de login del usuario en un pty. Si se indica
+        """Abre la shell de login del usuario en un pty. Si se indica
         `initial_cmd`, se teclea y ejecuta dentro de esa shell."""
         if not self._page_ready:
             self._pending_start = (cwd, initial_cmd)
@@ -104,8 +109,7 @@ class TerminalWidget(QWebEngineView):
         self.stop_process()
         self.bridge.cleared.emit()
 
-        shell = os.environ.get("SHELL", "/bin/zsh")
-        argv = [shell, "-l"]
+        argv = default_shell()
         log(f"terminal: shell {argv} (cwd={cwd}) cmd inicial: {initial_cmd or '-'}")
 
         env = dict(os.environ)
@@ -113,101 +117,48 @@ class TerminalWidget(QWebEngineView):
         env["COLORTERM"] = "truecolor"
         env.setdefault("LANG", "en_US.UTF-8")
 
-        pid, fd = pty.fork()
-        if pid == 0:  # hijo: solo chdir + exec, nada de Qt
-            try:
-                os.chdir(cwd)
-            except OSError:
-                pass
-            try:
-                os.execvpe(argv[0], argv, env)
-            except OSError:
-                os._exit(127)
-        self.pid, self.fd = pid, fd
+        self._backend = make_backend(self._on_data, self._on_child_exit, self)
         self._started_at = time.time()
-        self.resize_pty(self._cols, self._rows)
-        self._notifier = QSocketNotifier(fd, QSocketNotifier.Read, self)
-        self._notifier.activated.connect(self._read_pty)
+        try:
+            self._backend.spawn(argv, cwd, env, self._cols, self._rows)
+        except Exception as exc:  # pty/ConPTY no disponible o shell inválida
+            log(f"terminal: no se pudo abrir la shell: {exc!r}")
+            self._backend = None
+            self.process_finished.emit(-1)
+            return
         if initial_cmd:
-            # deja que el shell pinte su prompt antes de teclear el comando
-            QTimer.singleShot(700, lambda: self.write_pty(initial_cmd + "\n"))
+            # deja que la shell pinte su prompt antes de teclear el comando
+            QTimer.singleShot(700, lambda: self.write_pty(initial_cmd + submit_key()))
 
     def seconds_alive(self) -> float:
         return time.time() - self._started_at
 
     def stop_process(self):
-        if self._notifier:
-            self._notifier.setEnabled(False)
-            self._notifier.deleteLater()
-            self._notifier = None
-        if self.pid:
-            try:
-                os.killpg(os.getpgid(self.pid), signal.SIGHUP)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    os.kill(self.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-            try:
-                os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            self.pid = None
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+        if self._backend is not None:
+            self._backend.terminate()
+            self._backend.deleteLater()
+            self._backend = None
 
     # ------------------------------------------------ E/S del pty
 
-    def _read_pty(self):
-        try:
-            data = os.read(self.fd, 65536)
-        except OSError:
-            data = b""
-        if not data:
-            self._on_child_exit()
-            return
+    def _on_data(self, data: bytes):
         self.bridge.output.emit(base64.b64encode(data).decode("ascii"))
 
-    def _on_child_exit(self):
-        code = -1
-        if self.pid:
-            try:
-                _, status = os.waitpid(self.pid, os.WNOHANG)
-                code = os.waitstatus_to_exitcode(status) if status else 0
-            except ChildProcessError:
-                pass
+    def _on_child_exit(self, code: int):
         log(f"terminal: shell terminada (código {code})")
-        if self._notifier:
-            self._notifier.setEnabled(False)
-            self._notifier.deleteLater()
-            self._notifier = None
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-        self.pid = self.fd = None
+        if self._backend is not None:
+            self._backend.deleteLater()
+            self._backend = None
         self.process_finished.emit(code)
 
     def write_pty(self, data: str):
-        if self.fd is not None:
-            try:
-                os.write(self.fd, data.encode("utf-8"))
-            except OSError:
-                pass
+        if self._backend is not None:
+            self._backend.write(data)
 
     def resize_pty(self, cols: int, rows: int):
         self._cols, self._rows = max(cols, 2), max(rows, 2)
-        if self.fd is not None:
-            try:
-                fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
-                            struct.pack("HHHH", self._rows, self._cols, 0, 0))
-            except OSError:
-                pass
+        if self._backend is not None:
+            self._backend.resize(self._cols, self._rows)
 
 
 class ClaudeTerminalPanel(QWidget):
@@ -273,15 +224,10 @@ class ClaudeTerminalPanel(QWidget):
         cmd, cwd = claude_command(self.workdir, self.mode_combo.currentData(),
                                   self.connection)
         if self.connection is None:
-            return shlex.join(cmd), cwd
-        # remoto: el system prompt es multilínea; se envuelve en un script
-        # para teclear algo corto y legible en la shell
-        os.makedirs(os.path.dirname(SCRIPT_PATH), exist_ok=True)
-        with open(SCRIPT_PATH, "w") as f:
-            f.write("#!/bin/sh\n# Generado por Kodea: claude apuntando a "
-                    f"{self.connection.display}\nexec {shlex.join(cmd)}\n")
-        os.chmod(SCRIPT_PATH, 0o700)
-        return SCRIPT_PATH, cwd
+            return format_local_command(cmd), cwd
+        # remoto: el system prompt es multilínea; se envuelve en un lanzador
+        # (.sh en Unix, .ps1 en Windows) para teclear algo corto en la shell
+        return write_remote_launcher(cmd, self.connection), cwd
 
     def _on_mode_changed(self, _index: int):
         """Al elegir otro modo de permisos, cierra la sesión de claude actual

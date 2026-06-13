@@ -1,6 +1,22 @@
 """Tema oscuro estilo VS Code (Dark+), pulido."""
+import os
+import sys
+
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
+
+
+def _assets_url() -> str:
+    """Ruta de assets como URL para QSS (barras `/`, también en Windows y
+    en builds empaquetadas con PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(sys._MEIPASS, "kodea", "assets")  # type: ignore[attr-defined]
+    else:
+        base = os.path.join(os.path.dirname(__file__), "assets")
+    return base.replace(os.sep, "/")
+
+
+_A = _assets_url()
 
 # Paleta base
 BG = "#1e1e1e"            # fondo del editor
@@ -66,6 +82,12 @@ QTreeView::item:hover:!selected, QTreeWidget::item:hover:!selected {{
 QTreeView::branch {{
     background: transparent;
 }}
+QTreeView::branch:has-children:closed {{
+    image: url({_A}/chevron-right.svg);
+}}
+QTreeView::branch:has-children:open {{
+    image: url({_A}/chevron-down.svg);
+}}
 QListWidget::item {{
     padding: 8px 10px;
     border-radius: 4px;
@@ -106,12 +128,19 @@ QTabBar::tab:hover:!selected {{
     color: #cccccc;
 }}
 QTabBar::close-button {{
+    image: url({_A}/tab-close.svg);
     subcontrol-position: right;
-    margin: 2px;
-    border-radius: 3px;
+    width: 16px;
+    height: 16px;
+    margin: 2px 4px;
+    border-radius: 4px;
 }}
 QTabBar::close-button:hover {{
-    background: #5a5a5a;
+    image: url({_A}/tab-close-hover.svg);
+    background: #c75050;
+}}
+QTabBar::close-button:pressed {{
+    background: #a83f3f;
 }}
 
 /* ---------- botones ---------- */
