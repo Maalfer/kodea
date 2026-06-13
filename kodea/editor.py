@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QSize, QStringListModel, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -12,9 +12,10 @@ from PySide6.QtGui import (
     QSyntaxHighlighter,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
     QTextFormat,
 )
-from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
+from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit, QWidget
 
 from . import theme
 
@@ -175,6 +176,33 @@ class CodeEditor(QPlainTextEdit):
         self.comment_token = self.highlighter.comment_token
         self.document().modificationChanged.connect(self.modified_changed)
 
+        # apariencia más cómoda (cursor marcado, margen para respirar)
+        self.setCursorWidth(2)
+        self.document().setDocumentMargin(6)
+        self.setCenterOnScroll(True)
+
+        # autocompletado: palabras clave del lenguaje + palabras del documento
+        self._lang_words = self._build_lang_words(lang_for_path(path))
+        self._completer = QCompleter(self)
+        self._completer_model = QStringListModel(self._completer)
+        self._completer.setModel(self._completer_model)
+        self._completer.setWidget(self)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.popup().setObjectName("completer")
+        self._completer.activated.connect(self._insert_completion)
+
+        # resalta otras apariciones de la palabra seleccionada
+        self.selectionChanged.connect(self._highlight_current_line)
+
+    @staticmethod
+    def _build_lang_words(lang: str | None) -> set[str]:
+        spec = LANG_KEYWORDS.get(lang or "", {})
+        words: set[str] = set()
+        for key in ("keywords", "control"):
+            words.update(spec.get(key, "").split())
+        return words
+
     # --- zoom / tamaño de fuente ---
     def set_font_size(self, pt: int):
         pt = max(6, min(40, pt))
@@ -315,13 +343,40 @@ class CodeEditor(QPlainTextEdit):
             num += 1
 
     def _highlight_current_line(self):
-        sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor("#282828"))
-        sel.format.setProperty(QTextFormat.FullWidthSelection, True)
-        sel.cursor = self.textCursor()
-        sel.cursor.clearSelection()
-        self.setExtraSelections([sel] + self._bracket_selections())
+        line = QTextEdit.ExtraSelection()
+        line.format.setBackground(QColor("#282828"))
+        line.format.setProperty(QTextFormat.FullWidthSelection, True)
+        line.cursor = self.textCursor()
+        line.cursor.clearSelection()
+        self.setExtraSelections([line] + self._occurrence_selections()
+                                + self._bracket_selections())
         self._line_area.update()
+
+    def _occurrence_selections(self) -> list:
+        """Resalta las demás apariciones de la palabra seleccionada (como VS Code)."""
+        c = self.textCursor()
+        if not c.hasSelection() or self.document().characterCount() > 200_000:
+            return []
+        word = c.selectedText()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
+            return []
+        sels = []
+        doc = self.document()
+        found = QTextCursor(doc)
+        flags = QTextDocument.FindCaseSensitively | QTextDocument.FindWholeWords
+        while True:
+            found = doc.find(word, found, flags)
+            if found.isNull():
+                break
+            if found.selectionStart() == c.selectionStart():
+                continue  # la propia selección ya se ve resaltada
+            es = QTextEdit.ExtraSelection()
+            es.format.setBackground(QColor("#3a3d41"))
+            es.cursor = found
+            sels.append(es)
+            if len(sels) > 500:
+                break
+        return sels
 
     # --- emparejado de paréntesis/corchetes/llaves ---
     _OPEN = "([{"
@@ -370,18 +425,221 @@ class CodeEditor(QPlainTextEdit):
         sel.cursor.setPosition(pos + 1, QTextCursor.KeepAnchor)
         return sel
 
-    # --- indentación básica ---
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            cursor = self.textCursor()
-            line = cursor.block().text()
-            indent = line[: len(line) - len(line.lstrip())]
-            if line.rstrip().endswith((":", "{", "(", "[")):
-                indent += "    "
-            super().keyPressEvent(event)
-            self.insertPlainText(indent)
+    # --- autocompletado ---
+    def _completion_prefix(self) -> str:
+        c = self.textCursor()
+        text = c.block().text()
+        col = c.positionInBlock()
+        i = col
+        while i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
+            i -= 1
+        return text[i:col]
+
+    def _refresh_completions(self, prefix: str):
+        words = set(self._lang_words)
+        content = self.toPlainText()
+        if len(content) < 200_000:
+            words.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", content))
+        words.discard(prefix)
+        self._completer_model.setStringList(sorted(words, key=str.lower))
+
+    def _show_completion(self, force: bool = False):
+        prefix = self._completion_prefix()
+        if not force and len(prefix) < 2:
+            self._completer.popup().hide()
             return
-        if event.key() == Qt.Key_Tab and not self.textCursor().hasSelection():
-            self.insertPlainText("    ")
+        self._refresh_completions(prefix)
+        self._completer.setCompletionPrefix(prefix)
+        if self._completer.completionCount() == 0:
+            self._completer.popup().hide()
+            return
+        popup = self._completer.popup()
+        popup.setCurrentIndex(self._completer.completionModel().index(0, 0))
+        cr = self.cursorRect()
+        cr.moveTopLeft(self.viewport().mapTo(self, cr.topLeft()))
+        cr.setWidth(popup.sizeHintForColumn(0)
+                    + popup.verticalScrollBar().sizeHint().width() + 16)
+        self._completer.complete(cr)
+
+    def _insert_completion(self, text: str):
+        if self._completer.widget() is not self:
+            return
+        prefix = self._completer.completionPrefix()
+        cursor = self.textCursor()
+        cursor.insertText(text[len(prefix):])
+        self.setTextCursor(cursor)
+
+    def _maybe_complete(self, event):
+        ch = event.text()[-1:] if event.text() else ""
+        if ch and (ch.isalnum() or ch == "_"):
+            self._show_completion(False)
+        else:
+            self._completer.popup().hide()
+
+    # --- auto-cierre de pares, Enter inteligente e indentación ---
+    _PAIRS = {"(": ")", "[": "]", "{": "}"}
+    _QUOTES = {'"', "'", "`"}
+
+    def _char_after(self) -> str:
+        c = self.textCursor()
+        col = c.positionInBlock()
+        return c.block().text()[col:col + 1]
+
+    def _char_before(self) -> str:
+        c = self.textCursor()
+        col = c.positionInBlock()
+        return c.block().text()[col - 1:col] if col > 0 else ""
+
+    def keyPressEvent(self, event):
+        comp = self._completer
+        # con el popup abierto, deja que gestione navegación/aceptación
+        if comp.popup().isVisible() and event.key() in (
+                Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Escape):
+            event.ignore()
+            return
+        # Ctrl+Espacio fuerza el autocompletado
+        if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Space:
+            self._show_completion(force=True)
+            return
+        if self._handle_pairs_and_indent(event):
             return
         super().keyPressEvent(event)
+        self._maybe_complete(event)
+
+    def _handle_pairs_and_indent(self, event) -> bool:
+        key = event.key()
+        text = event.text()
+        cursor = self.textCursor()
+
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            return self._handle_return()
+
+        if key == Qt.Key_Tab:
+            if cursor.hasSelection():
+                self._indent_selection(1)
+                return True
+            self.insertPlainText("    ")
+            return True
+        if key == Qt.Key_Backtab:
+            self._indent_selection(-1)
+            return True
+
+        if key == Qt.Key_Backspace and not cursor.hasSelection():
+            before, after = self._char_before(), self._char_after()
+            if (before in self._PAIRS and after == self._PAIRS[before]) or \
+               (before in self._QUOTES and after == before):
+                c = self.textCursor()
+                c.beginEditBlock()
+                c.deletePreviousChar()
+                c.deleteChar()
+                c.endEditBlock()
+                return True
+            return False
+
+        if text in self._PAIRS:
+            close = self._PAIRS[text]
+            if cursor.hasSelection():
+                cursor.insertText(text + cursor.selectedText() + close)
+                return True
+            cursor.insertText(text + close)
+            cursor.movePosition(QTextCursor.Left)
+            self.setTextCursor(cursor)
+            return True
+
+        if text and text in self._PAIRS.values():
+            if self._char_after() == text:  # salta por encima del cierre ya puesto
+                cursor.movePosition(QTextCursor.Right)
+                self.setTextCursor(cursor)
+                return True
+            return False
+
+        if text in self._QUOTES:
+            if cursor.hasSelection():
+                cursor.insertText(text + cursor.selectedText() + text)
+                return True
+            if self._char_after() == text:
+                cursor.movePosition(QTextCursor.Right)
+                self.setTextCursor(cursor)
+                return True
+            before = self._char_before()
+            if before.isalnum() or before == text:  # apóstrofo dentro de palabra
+                return False
+            cursor.insertText(text + text)
+            cursor.movePosition(QTextCursor.Left)
+            self.setTextCursor(cursor)
+            return True
+
+        return False
+
+    def _handle_return(self) -> bool:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return False
+        line = cursor.block().text()
+        indent = line[: len(line) - len(line.lstrip())]
+        before, after = self._char_before(), self._char_after()
+        # cursor entre un par {|} () [] → abre bloque indentado
+        if before in self._PAIRS and after == self._PAIRS[before]:
+            c = self.textCursor()
+            c.beginEditBlock()
+            c.insertText("\n" + indent + "    \n" + indent)
+            c.movePosition(QTextCursor.Up)
+            c.movePosition(QTextCursor.EndOfLine)
+            c.endEditBlock()
+            self.setTextCursor(c)
+            return True
+        extra = "    " if line.rstrip().endswith((":", "{", "(", "[")) else ""
+        cursor.beginEditBlock()
+        cursor.insertText("\n" + indent + extra)
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
+        return True
+
+    def _indent_selection(self, direction: int):
+        doc = self.document()
+        cursor = self.textCursor()
+        first = doc.findBlock(cursor.selectionStart()).blockNumber()
+        last = doc.findBlock(cursor.selectionEnd()).blockNumber()
+        edit = self.textCursor()
+        edit.beginEditBlock()
+        for n in range(first, last + 1):
+            blk = doc.findBlockByNumber(n)
+            bc = QTextCursor(blk)
+            bc.movePosition(QTextCursor.StartOfBlock)
+            if direction > 0:
+                bc.insertText("    ")
+            else:
+                btext = blk.text()
+                remove = 0
+                while remove < 4 and remove < len(btext) and btext[remove] == " ":
+                    remove += 1
+                if remove == 0 and btext[:1] == "\t":
+                    remove = 1
+                for _ in range(remove):
+                    bc.deleteChar()
+        edit.endEditBlock()
+
+    # --- guías de indentación ---
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        sw = self.fontMetrics().horizontalAdvance(" ")
+        if sw <= 0:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QColor("#34373b"))
+        base = self.contentOffset().x() + self.document().documentMargin()
+        block = self.firstVisibleBlock()
+        offset = self.contentOffset()
+        while block.isValid():
+            geo = self.blockBoundingGeometry(block).translated(offset)
+            if geo.top() > event.rect().bottom():
+                break
+            if block.isVisible():
+                text = block.text()
+                level = (len(text) - len(text.lstrip(" "))) // 4
+                top, bottom = int(geo.top()), int(geo.bottom())
+                for lvl in range(1, level + 1):
+                    x = int(base + lvl * 4 * sw)
+                    painter.drawLine(x, top, x, bottom)
+            block = block.next()
+        painter.end()

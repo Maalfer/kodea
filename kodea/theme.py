@@ -322,6 +322,24 @@ QCheckBox:checked {{
     color: {ACCENT_LINE};
     font-weight: bold;
 }}
+
+/* ---------- popup de autocompletado ---------- */
+QListView#completer {{
+    background: {BG_SIDE};
+    border: 1px solid #454545;
+    border-radius: 6px;
+    color: {FG};
+    padding: 3px;
+    outline: none;
+}}
+QListView#completer::item {{
+    padding: 4px 10px;
+    border-radius: 4px;
+}}
+QListView#completer::item:selected {{
+    background: {ACCENT};
+    color: #ffffff;
+}}
 """
 
 
