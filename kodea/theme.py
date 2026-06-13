@@ -323,6 +323,34 @@ QCheckBox:checked {{
     font-weight: bold;
 }}
 
+/* ---------- barra de revisión de cambios de Claude ---------- */
+QFrame#reviewBar {{
+    background: #2a2d2e;
+    border: 1px solid #3c6b3c;
+    border-radius: 8px;
+}}
+QLabel#reviewLabel {{
+    color: #b5e0b5;
+    font-size: 12px;
+    font-weight: 600;
+}}
+QFrame#reviewBar QToolButton {{
+    background: transparent;
+    color: {FG};
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px 7px;
+}}
+QFrame#reviewBar QToolButton:hover {{
+    background: {BG_INPUT};
+    border: 1px solid #4a4a4a;
+}}
+QPushButton#reviewUndo {{
+    background: #6e3a3a;
+    padding: 4px 12px;
+}}
+QPushButton#reviewUndo:hover {{ background: #8a4646; }}
+
 /* ---------- popup de autocompletado ---------- */
 QListView#completer {{
     background: {BG_SIDE};

@@ -1,6 +1,7 @@
 """Ventana principal: explorador + editor con pestañas + chat de Claude Code."""
 from __future__ import annotations
 
+import difflib
 import os
 import re
 
@@ -64,6 +65,25 @@ def _first_diff_line(old: str, new: str) -> int:
         if a[i] != b[i]:
             return i
     return max(0, min(len(a), len(b)) - 1)
+
+
+def diff_regions(old: str, new: str):
+    """Compara `old` vs `new` por líneas y devuelve:
+    - added:   lista de rangos [j1, j2) de líneas NUEVAS (resaltar en verde)
+    - deleted: lista de índices (línea nueva) donde se borraron líneas (marca roja)
+    - hunks:   nº de bloques de cambio."""
+    a, b = old.split("\n"), new.split("\n")
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    added, deleted, hunks = [], [], 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        hunks += 1
+        if tag in ("replace", "insert"):
+            added.append((j1, j2))
+        if tag in ("replace", "delete"):
+            deleted.append(j1)
+    return added, deleted, hunks
 
 
 # --------------------------------------------------------------- tareas en 2º plano
@@ -734,6 +754,7 @@ class MainWindow(QMainWindow):
         editor = CodeEditor(path, font_size=self.editor_font_pt)
         editor.fs = self.fs
         editor.zoom_requested.connect(self.zoom_step)
+        editor.change_undo.connect(lambda ed=editor: self._undo_change(ed))
         if getattr(self, "act_wrap", None) and self.act_wrap.isChecked():
             from PySide6.QtWidgets import QPlainTextEdit
             editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
@@ -893,11 +914,22 @@ class MainWindow(QMainWindow):
         self._fs_snapshot = snapshot
         if not changed:
             return
-        newest = max(changed, key=lambda p: snapshot[p]) if self.follow_enabled else None
+        if not self.follow_enabled:
+            # follow desactivado: recarga silenciosa, sin resaltar
+            for p in changed:
+                self._reload_if_open(p, jump=False)
+            return
+        newest = max(changed, key=lambda p: snapshot[p])
         for p in changed:
-            self._reload_if_open(p, jump=(p == newest))
-        if newest is not None:
+            if self._tab_for_path(p) is not None:
+                # archivo abierto: aplica el cambio y resáltalo (con Deshacer)
+                self._show_change_diff(p, jump=(p == newest))
+        # trae al frente / abre el archivo recién tocado
+        if self._tab_for_path(newest) is None:
             self._reveal_file(newest)
+        else:
+            self.tabs.setCurrentIndex(self._tab_for_path(newest))
+            self.tree.reveal(newest)
 
     def _reload_if_open(self, path: str, jump: bool = False):
         """Recarga la pestaña de `path` si está abierta y sin cambios propios.
@@ -942,6 +974,73 @@ class MainWindow(QMainWindow):
         w.document().setModified(False)
         self.statusBar().showMessage(
             f"♻ {os.path.basename(path)} actualizado por Claude", 4000)
+
+    def _show_change_diff(self, path: str, jump: bool = False):
+        """Aplica el cambio de Claude (auto-aceptado) en la pestaña abierta y lo
+        resalta (verde lo añadido, rojo lo borrado) con opción de Deshacer."""
+        idx = self._tab_for_path(path)
+        if idx is None:
+            return
+        ed = self.tabs.widget(idx)
+        if ed.document().isModified():
+            self.statusBar().showMessage(
+                f"⚠ {os.path.basename(path)}: Claude lo cambió, pero tienes "
+                f"ediciones sin guardar (no se toca)", 6000)
+            return
+        try:
+            m = ed.fs.mtime(path)
+        except Exception:
+            return
+        if m == getattr(ed, "_mtime", None):
+            return
+        try:
+            fresh = ed.fs.read_text(path)
+        except Exception:
+            return
+        # baseline = estado previo (si ya estaba en revisión, conserva el original
+        # para que «Deshacer» revierta todo el lote de cambios de Claude)
+        baseline = ed.review_baseline if ed.in_review else ed.toPlainText()
+        ed._mtime = m
+        self._fs_snapshot[path] = m
+        if fresh == baseline:
+            ed.clear_review()
+            return
+        added, deleted, hunks = diff_regions(baseline, fresh)
+        pos = ed.textCursor().position()
+        scroll = ed.verticalScrollBar().value()
+        ed.set_text_silently(fresh)
+        ed.document().setModified(False)
+        ed.enter_review(baseline, added, deleted, hunks)
+        if jump:
+            ed.goto_change(0)
+        else:
+            cursor = ed.textCursor()
+            cursor.setPosition(min(pos, len(fresh)))
+            ed.setTextCursor(cursor)
+            ed.verticalScrollBar().setValue(scroll)
+        self.statusBar().showMessage(
+            f"✦ {os.path.basename(path)}: {hunks} cambio(s) de Claude — "
+            f"Deshacer si no te convencen", 5000)
+
+    def _undo_change(self, ed: CodeEditor):
+        """Revierte el archivo al estado previo a los cambios de Claude (también
+        en disco / VPS) y quita el resaltado."""
+        baseline = ed.review_baseline
+        if baseline is None:
+            ed.clear_review()
+            return
+        ed.set_text_silently(baseline)
+        try:
+            ed.fs.write_text(ed.path, baseline)
+            ed._mtime = ed.fs.mtime(ed.path)
+            self._fs_snapshot[ed.path] = ed._mtime
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo deshacer:\n{e}")
+            return
+        ed.document().setModified(False)
+        ed.clear_review()
+        self.statusBar().showMessage(
+            f"↩ {os.path.basename(ed.path)} restaurado (cambios de Claude deshechos)", 4000)
 
     def _reveal_file(self, path: str):
         """Trae al frente (y abre si hace falta) el archivo editado por Claude,

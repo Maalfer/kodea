@@ -15,7 +15,17 @@ from PySide6.QtGui import (
     QTextDocument,
     QTextFormat,
 )
-from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit, QWidget
+from PySide6.QtWidgets import (
+    QCompleter,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QTextEdit,
+    QToolButton,
+    QWidget,
+)
 
 from . import theme
 
@@ -150,14 +160,64 @@ class LineNumberArea(QWidget):
 DEFAULT_FONT_SIZE = 13
 
 
+class ReviewBar(QFrame):
+    """Tarjeta flotante que avisa de los cambios de Claude (ya aplicados) y
+    permite navegarlos o deshacerlos."""
+
+    def __init__(self, editor: "CodeEditor"):
+        super().__init__(editor)
+        self.setObjectName("reviewBar")
+        self.editor = editor
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 6, 8, 6)
+        lay.setSpacing(8)
+
+        self.label = QLabel("Claude editó este archivo")
+        self.label.setObjectName("reviewLabel")
+        lay.addWidget(self.label)
+
+        for text, tip, slot in (("‹", "Cambio anterior", lambda: editor.goto_change(-1)),
+                                ("›", "Cambio siguiente", lambda: editor.goto_change(1))):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            lay.addWidget(b)
+
+        self.btn_undo = QPushButton("Deshacer")
+        self.btn_undo.setObjectName("reviewUndo")
+        self.btn_undo.setToolTip("Revertir estos cambios de Claude")
+        self.btn_undo.clicked.connect(editor.change_undo)
+        lay.addWidget(self.btn_undo)
+
+        self.btn_close = QToolButton()
+        self.btn_close.setText("✕")
+        self.btn_close.setToolTip("Ocultar resaltado (mantener cambios)")
+        self.btn_close.clicked.connect(editor.clear_review)
+        lay.addWidget(self.btn_close)
+        self.hide()
+
+    def set_count(self, hunks: int):
+        n = f"{hunks} bloque" + ("" if hunks == 1 else "s")
+        self.label.setText(f"✦ Claude cambió {n}")
+
+
 class CodeEditor(QPlainTextEdit):
     modified_changed = Signal(bool)
     zoom_requested = Signal(int)  # +1 / -1 con Ctrl + rueda del ratón
+    change_undo = Signal()        # deshacer el último lote de cambios de Claude
 
     def __init__(self, path: str = "", parent=None, font_size: int = DEFAULT_FONT_SIZE):
         super().__init__(parent)
         self.path = path
         self._font_pt = font_size
+        # estado de revisión de cambios de Claude (antes de cualquier resaltado)
+        self._review_bar: ReviewBar | None = None
+        self._in_review = False
+        self._review_baseline: str | None = None
+        self._review_added: list[tuple[int, int]] = []
+        self._review_deleted: list[int] = []
+        self._applying = False
         font = QFont(theme.EDITOR_FONT)
         font.setPointSize(font_size)
         font.setStyleHint(QFont.Monospace)
@@ -195,6 +255,9 @@ class CodeEditor(QPlainTextEdit):
         # resalta otras apariciones de la palabra seleccionada
         self.selectionChanged.connect(self._highlight_current_line)
 
+        # si el usuario escribe durante la revisión, se quita el resaltado
+        self.document().contentsChanged.connect(self._on_contents_changed)
+
     @staticmethod
     def _build_lang_words(lang: str | None) -> set[str]:
         spec = LANG_KEYWORDS.get(lang or "", {})
@@ -202,6 +265,101 @@ class CodeEditor(QPlainTextEdit):
         for key in ("keywords", "control"):
             words.update(spec.get(key, "").split())
         return words
+
+    # --- revisión de cambios de Claude ---
+    def enter_review(self, baseline: str, added, deleted, hunks: int):
+        """Entra en modo revisión: el buffer ya tiene el contenido nuevo;
+        `added` son rangos [j1,j2) de líneas nuevas y `deleted` posiciones
+        (línea nueva) donde se borraron líneas."""
+        self._review_baseline = baseline
+        self._review_added = list(added)
+        self._review_deleted = list(deleted)
+        self._in_review = True
+        if self._review_bar is None:
+            self._review_bar = ReviewBar(self)
+        self._review_bar.set_count(hunks)
+        self._review_bar.show()
+        self._review_bar.raise_()
+        self._position_review_bar()
+        self._highlight_current_line()
+        self.viewport().update()
+
+    def clear_review(self):
+        self._in_review = False
+        self._review_baseline = None
+        self._review_added = []
+        self._review_deleted = []
+        if self._review_bar is not None:
+            self._review_bar.hide()
+        self._highlight_current_line()
+        self.viewport().update()
+
+    @property
+    def in_review(self) -> bool:
+        return self._in_review
+
+    @property
+    def review_baseline(self) -> str | None:
+        return self._review_baseline
+
+    def set_text_silently(self, text: str):
+        """Cambia el contenido sin que se interprete como edición del usuario."""
+        self._applying = True
+        self.setPlainText(text)
+        self._applying = False
+
+    def _on_contents_changed(self):
+        # si el usuario escribe durante la revisión, asumimos que acepta y
+        # quitamos los resaltados (sus cambios se conservan)
+        if self._in_review and not self._applying:
+            self.clear_review()
+
+    def _review_selections(self) -> list:
+        if not self._in_review:
+            return []
+        sels = []
+        doc = self.document()
+        for j1, j2 in self._review_added:
+            for ln in range(j1, j2):
+                blk = doc.findBlockByNumber(ln)
+                if not blk.isValid():
+                    continue
+                es = QTextEdit.ExtraSelection()
+                es.format.setBackground(QColor("#16351f"))
+                es.format.setProperty(QTextFormat.FullWidthSelection, True)
+                es.cursor = QTextCursor(blk)
+                sels.append(es)
+        return sels
+
+    def _change_anchors(self) -> list[int]:
+        return sorted(set([a for a, _ in self._review_added] + self._review_deleted))
+
+    def goto_change(self, direction: int):
+        anchors = self._change_anchors()
+        if not anchors:
+            return
+        cur = self.textCursor().blockNumber()
+        if direction == 0:
+            target = anchors[0]
+        elif direction > 0:
+            target = next((a for a in anchors if a > cur), anchors[0])
+        else:
+            target = next((a for a in reversed(anchors) if a < cur), anchors[-1])
+        blk = self.document().findBlockByNumber(target)
+        c = self.textCursor()
+        c.setPosition(blk.position())
+        self.setTextCursor(c)
+        self.centerCursor()
+
+    def _position_review_bar(self):
+        bar = self._review_bar
+        if bar is None:
+            return
+        sz = bar.sizeHint()
+        avail = self.width() - self.line_number_width() - 16
+        w = min(sz.width(), max(avail, 120))
+        x = max(self.line_number_width() + 8, self.width() - w - 18)
+        bar.setGeometry(x, 8, w, sz.height())
 
     # --- zoom / tamaño de fuente ---
     def set_font_size(self, pt: int):
@@ -319,6 +477,8 @@ class CodeEditor(QPlainTextEdit):
         super().resizeEvent(event)
         cr = self.contentsRect()
         self._line_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_width(), cr.height()))
+        if self._review_bar is not None and self._review_bar.isVisible():
+            self._position_review_bar()
 
     def paint_line_numbers(self, event):
         painter = QPainter(self._line_area)
@@ -348,7 +508,8 @@ class CodeEditor(QPlainTextEdit):
         line.format.setProperty(QTextFormat.FullWidthSelection, True)
         line.cursor = self.textCursor()
         line.cursor.clearSelection()
-        self.setExtraSelections([line] + self._occurrence_selections()
+        self.setExtraSelections([line] + self._review_selections()
+                                + self._occurrence_selections()
                                 + self._bracket_selections())
         self._line_area.update()
 
@@ -619,15 +780,15 @@ class CodeEditor(QPlainTextEdit):
                     bc.deleteChar()
         edit.endEditBlock()
 
-    # --- guías de indentación ---
+    # --- guías de indentación + marcas de borrado en revisión ---
     def paintEvent(self, event):
         super().paintEvent(event)
         sw = self.fontMetrics().horizontalAdvance(" ")
         if sw <= 0:
             return
         painter = QPainter(self.viewport())
-        painter.setPen(QColor("#34373b"))
         base = self.contentOffset().x() + self.document().documentMargin()
+        deleted = set(self._review_deleted) if self._in_review else set()
         block = self.firstVisibleBlock()
         offset = self.contentOffset()
         while block.isValid():
@@ -638,8 +799,13 @@ class CodeEditor(QPlainTextEdit):
                 text = block.text()
                 level = (len(text) - len(text.lstrip(" "))) // 4
                 top, bottom = int(geo.top()), int(geo.bottom())
+                painter.setPen(QColor("#34373b"))
                 for lvl in range(1, level + 1):
                     x = int(base + lvl * 4 * sw)
                     painter.drawLine(x, top, x, bottom)
+                if block.blockNumber() in deleted:
+                    # líneas borradas por Claude justo encima de esta
+                    painter.setPen(QColor("#f14c4c"))
+                    painter.drawLine(0, top, self.viewport().width(), top)
             block = block.next()
         painter.end()
