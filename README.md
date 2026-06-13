@@ -22,6 +22,7 @@
 - **Terminal integrada al 100%**: el panel derecho es un terminal real (xterm.js + pseudo-terminal) con tu shell de login — zsh/bash en macOS y Linux, PowerShell en Windows, con tu prompt y tu PATH. Al abrir un proyecto, Kodea ejecuta `claude` dentro de esa shell y tienes la TUI completa de Claude Code: permisos interactivos, `/comandos`, `Shift+Tab`, colores… Al salir de claude sigues en tu terminal y puedes ejecutar lo que quieras.
 - **SSH a VPS**: define conexiones (host, usuario, clave, directorio). El explorador y el editor funcionan por SFTP. Claude es siempre **tu Claude Code local** (tu sesión de este equipo): con una conexión activa recibe el comando ssh de esa conexión y opera sobre el servidor a través de él (leer, editar y ejecutar en remoto). No hace falta instalar `claude` en el VPS.
 - **Multiplataforma**: una sola base de código que abre la shell adecuada en macOS, Windows y Linux.
+- **Barra de menús completa** (Archivo, Editar, Selección, Ver, Ir, Terminal, Remoto, Ayuda) con lo típico de un editor profesional: buscar/reemplazar (Ctrl+F / Ctrl+H), comentar línea (Ctrl+/), mover/duplicar/eliminar líneas, ir a línea (Ctrl+G), alternar explorador/terminal (Ctrl+B / Ctrl+J)… y **zoom del editor con Ctrl + / Ctrl - / Ctrl 0** (o Ctrl + rueda del ratón). Los atajos que coinciden con teclas de control del terminal (Ctrl+C, Ctrl+W…) solo actúan con el editor enfocado, así que tu terminal no se ve afectada.
 
 ## 📦 Instalación
 

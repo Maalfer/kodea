@@ -295,6 +295,33 @@ QWidget#panelBar {{
 QDialogButtonBox QPushButton {{
     min-width: 70px;
 }}
+
+/* ---------- barra de búsqueda ---------- */
+QWidget#findBar {{
+    background: {BG_PANEL};
+    border-bottom: 1px solid #1b1b1c;
+}}
+QWidget#findBar QToolButton {{
+    background: transparent;
+    color: {FG};
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 13px;
+}}
+QWidget#findBar QToolButton:hover {{
+    background: {BG_INPUT};
+    border: 1px solid #4a4a4a;
+}}
+QCheckBox {{
+    color: {FG};
+    spacing: 4px;
+    padding: 2px 4px;
+}}
+QCheckBox:checked {{
+    color: {ACCENT_LINE};
+    font-weight: bold;
+}}
 """
 
 

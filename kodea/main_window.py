@@ -2,15 +2,26 @@
 from __future__ import annotations
 
 import os
+import re
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QKeySequence,
+    QTextCursor,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -18,11 +29,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from . import icons
+from . import __version__, icons
 from .terminal import ClaudeTerminalPanel
 from .connections import Connection, ConnectionDialog, ConnectionStore
 from .editor import CodeEditor, lang_for_path
@@ -163,6 +175,139 @@ class WelcomeWidget(QWidget):
         outer.addStretch(3)
 
 
+class FindBar(QWidget):
+    """Barra de búsqueda y reemplazo sobre el editor activo (estilo VS Code)."""
+
+    def __init__(self, editor_getter, parent=None):
+        super().__init__(parent)
+        self.get_editor = editor_getter
+        self.setObjectName("findBar")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(6)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Buscar")
+        self.search.returnPressed.connect(self.find_next)
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search, 1)
+
+        self.case = QCheckBox("Aa")
+        self.case.setToolTip("Distinguir mayúsculas/minúsculas")
+        lay.addWidget(self.case)
+
+        for text, tip, cb in (
+            ("‹", "Anterior (⇧Intro)", self.find_prev),
+            ("›", "Siguiente (Intro)", self.find_next),
+        ):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.clicked.connect(cb)
+            lay.addWidget(b)
+
+        self.replace = QLineEdit()
+        self.replace.setPlaceholderText("Reemplazar")
+        self.replace.returnPressed.connect(self.replace_one)
+        lay.addWidget(self.replace, 1)
+
+        self.btn_rep = QToolButton()
+        self.btn_rep.setText("Reemplazar")
+        self.btn_rep.clicked.connect(self.replace_one)
+        lay.addWidget(self.btn_rep)
+        self.btn_rep_all = QToolButton()
+        self.btn_rep_all.setText("Todo")
+        self.btn_rep_all.clicked.connect(self.replace_all)
+        lay.addWidget(self.btn_rep_all)
+
+        close = QToolButton()
+        close.setText("✕")
+        close.setToolTip("Cerrar (Esc)")
+        close.clicked.connect(self.hide_bar)
+        lay.addWidget(close)
+
+        self.hide()
+
+    def show_for(self, replace: bool):
+        ed = self.get_editor()
+        if ed is not None:
+            sel = ed.textCursor().selectedText()
+            if sel and " " not in sel:
+                self.search.setText(sel)
+        for w in (self.replace, self.btn_rep, self.btn_rep_all):
+            w.setVisible(replace)
+        self.show()
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def hide_bar(self):
+        self.hide()
+        ed = self.get_editor()
+        if ed is not None:
+            ed.setFocus()
+
+    def _flags(self, backward: bool = False):
+        flags = QTextDocument.FindFlags()
+        if self.case.isChecked():
+            flags |= QTextDocument.FindCaseSensitively
+        if backward:
+            flags |= QTextDocument.FindBackward
+        return flags
+
+    def _find(self, backward: bool = False):
+        ed = self.get_editor()
+        text = self.search.text()
+        if ed is None or not text:
+            return
+        if not ed.find(text, self._flags(backward)):
+            # no hay más: vuelve al principio/final y reintenta (búsqueda cíclica)
+            cur = ed.textCursor()
+            cur.movePosition(QTextCursor.End if backward else QTextCursor.Start)
+            ed.setTextCursor(cur)
+            ed.find(text, self._flags(backward))
+
+    def find_next(self):
+        self._find(backward=False)
+
+    def find_prev(self):
+        self._find(backward=True)
+
+    def replace_one(self):
+        ed = self.get_editor()
+        if ed is None or not self.search.text():
+            return
+        cur = ed.textCursor()
+        sel = cur.selectedText()
+        target = self.search.text()
+        match = sel == target if self.case.isChecked() else sel.lower() == target.lower()
+        if sel and match:
+            cur.insertText(self.replace.text())
+        self.find_next()
+
+    def replace_all(self):
+        ed = self.get_editor()
+        text = self.search.text()
+        if ed is None or not text:
+            return
+        flags = 0 if self.case.isChecked() else re.IGNORECASE
+        content = ed.toPlainText()
+        new, n = re.subn(re.escape(text), lambda _m: self.replace.text(), content, flags=flags)
+        if n:
+            cur = ed.textCursor()
+            cur.beginEditBlock()
+            cur.select(QTextCursor.Document)
+            cur.insertText(new)
+            cur.endEditBlock()
+        if self.window():
+            self.window().statusBar().showMessage(f"{n} reemplazo(s)", 3000)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.hide_bar()
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -185,15 +330,19 @@ class MainWindow(QMainWindow):
         # hilo de trabajo accede a un QObject destruido (crash)
         self._tasks: set = set()
 
-        # --- layout: [explorador | editor | chat] ---
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(1)
-        splitter.setChildrenCollapsible(False)
-        self.setCentralWidget(splitter)
+        # tamaño de fuente del editor (zoom); se aplica a todas las pestañas
+        from .editor import DEFAULT_FONT_SIZE
+        self.editor_font_pt = DEFAULT_FONT_SIZE
 
-        sidebar = QWidget()
-        sidebar.setMinimumWidth(180)
-        sl = QVBoxLayout(sidebar)
+        # --- layout: [explorador | editor | chat] ---
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setHandleWidth(1)
+        self.splitter.setChildrenCollapsible(False)
+        self.setCentralWidget(self.splitter)
+
+        self.sidebar = QWidget()
+        self.sidebar.setMinimumWidth(180)
+        sl = QVBoxLayout(self.sidebar)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
         explorer_title = QLabel("EXPLORADOR")
@@ -206,10 +355,10 @@ class MainWindow(QMainWindow):
         self.tree = FileTree()
         self.tree.file_activated.connect(self.open_file)
         sl.addWidget(self.tree, 1)
-        splitter.addWidget(sidebar)
+        self.splitter.addWidget(self.sidebar)
 
+        # columna del editor: barra de búsqueda (oculta) + pestañas
         self.tabs = QTabWidget()
-        self.tabs.setMinimumWidth(320)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
@@ -217,16 +366,25 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(lambda _: self._update_cursor_status())
         welcome = WelcomeWidget(self.open_local_folder, self.show_connections)
         self.tabs.addTab(welcome, "Bienvenida")
-        splitter.addWidget(self.tabs)
+
+        self.editor_col = QWidget()
+        self.editor_col.setMinimumWidth(320)
+        ec = QVBoxLayout(self.editor_col)
+        ec.setContentsMargins(0, 0, 0, 0)
+        ec.setSpacing(0)
+        self.find_bar = FindBar(self._current_editor)
+        ec.addWidget(self.find_bar)
+        ec.addWidget(self.tabs, 1)
+        self.splitter.addWidget(self.editor_col)
 
         self.chat = ClaudeTerminalPanel()
         self.chat.setMinimumWidth(360)
-        splitter.addWidget(self.chat)
+        self.splitter.addWidget(self.chat)
 
-        splitter.setSizes([240, 700, 540])
-        splitter.setStretchFactor(0, 0)  # explorador: ancho fijo
-        splitter.setStretchFactor(1, 1)  # editor: absorbe el espacio extra
-        splitter.setStretchFactor(2, 0)  # terminal: ancho fijo
+        self.splitter.setSizes([240, 700, 540])
+        self.splitter.setStretchFactor(0, 0)  # explorador: ancho fijo
+        self.splitter.setStretchFactor(1, 1)  # editor: absorbe el espacio extra
+        self.splitter.setStretchFactor(2, 0)  # terminal: ancho fijo
 
         # barra de estado: conexión a la izquierda, cursor/lenguaje a la derecha
         self.conn_status = QLabel("⬤ Local")
@@ -246,37 +404,232 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- menú
 
+    def _act(self, menu, text, slot, shortcut=None):
+        """Acción a nivel de ventana (atajo global mientras Kodea está activa)."""
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcuts([QKeySequence(s) for s in (shortcut if isinstance(shortcut, (list, tuple)) else [shortcut])])
+        a.triggered.connect(slot)
+        menu.addAction(a)
+        return a
+
+    def _act_ed(self, menu, text, slot, shortcut=None):
+        """Acción acotada al editor: el atajo solo actúa cuando el foco está en
+        el editor, para no pisar las teclas de control del terminal."""
+        a = QAction(text, self.editor_col)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+            a.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        a.triggered.connect(slot)
+        self.editor_col.addAction(a)
+        menu.addAction(a)
+        return a
+
     def _build_menu(self):
-        m_file = self.menuBar().addMenu("Archivo")
-        act_open = QAction("Abrir carpeta…", self)
-        act_open.setShortcut(QKeySequence("Ctrl+O"))
-        act_open.triggered.connect(self.open_local_folder)
-        m_file.addAction(act_open)
-        act_save = QAction("Guardar", self)
-        act_save.setShortcut(QKeySequence.Save)
-        act_save.triggered.connect(self.save_current)
-        m_file.addAction(act_save)
-        act_refresh = QAction("Recargar explorador", self)
-        act_refresh.setShortcut(QKeySequence("Ctrl+R"))
-        act_refresh.triggered.connect(self.tree.refresh)
-        m_file.addAction(act_refresh)
+        bar = self.menuBar()
 
-        m_remote = self.menuBar().addMenu("Remoto")
-        act_connect = QAction("Conectar a VPS…", self)
-        act_connect.setShortcut(QKeySequence("Ctrl+Shift+P"))
-        act_connect.triggered.connect(self.show_connections)
-        m_remote.addAction(act_connect)
-        act_disconnect = QAction("Desconectar (volver a local)", self)
-        act_disconnect.triggered.connect(self.disconnect_remote)
-        m_remote.addAction(act_disconnect)
+        # --- Archivo ---
+        m_file = bar.addMenu("&Archivo")
+        self._act(m_file, "Abrir carpeta…", self.open_local_folder, "Ctrl+O")
+        self._act(m_file, "Abrir archivo…", self.open_file_dialog, "Ctrl+Shift+O")
+        self._act(m_file, "Recargar explorador", self.tree.refresh, "Ctrl+R")
+        m_file.addSeparator()
+        self._act(m_file, "Guardar", self.save_current, "Ctrl+S")
+        self._act_ed(m_file, "Guardar como…", self.save_as, "Ctrl+Shift+S")
+        self._act(m_file, "Guardar todo", self.save_all, "Ctrl+Alt+S")
+        m_file.addSeparator()
+        self._act_ed(m_file, "Cerrar pestaña", self.close_current_tab, "Ctrl+W")
+        self._act(m_file, "Cerrar todas las pestañas", self.close_all_tabs)
+        m_file.addSeparator()
+        self._act(m_file, "Salir", self.close, "Ctrl+Q")
 
-        m_view = self.menuBar().addMenu("Ver")
+        # --- Editar ---
+        m_edit = bar.addMenu("&Editar")
+        self._act_ed(m_edit, "Deshacer", lambda: self._ed_call("undo"), "Ctrl+Z")
+        self._act_ed(m_edit, "Rehacer", lambda: self._ed_call("redo"), "Ctrl+Shift+Z")
+        m_edit.addSeparator()
+        self._act_ed(m_edit, "Cortar", lambda: self._ed_call("cut"), "Ctrl+X")
+        self._act_ed(m_edit, "Copiar", lambda: self._ed_call("copy"), "Ctrl+C")
+        self._act_ed(m_edit, "Pegar", lambda: self._ed_call("paste"), "Ctrl+V")
+        m_edit.addSeparator()
+        self._act_ed(m_edit, "Buscar", lambda: self.find_bar.show_for(False), "Ctrl+F")
+        self._act_ed(m_edit, "Buscar siguiente", self.find_bar.find_next, "F3")
+        self._act_ed(m_edit, "Reemplazar", lambda: self.find_bar.show_for(True), "Ctrl+H")
+        m_edit.addSeparator()
+        self._act_ed(m_edit, "Comentar/descomentar línea", lambda: self._ed_call("toggle_comment"), "Ctrl+/")
+
+        # --- Selección ---
+        m_sel = bar.addMenu("&Selección")
+        self._act_ed(m_sel, "Seleccionar todo", lambda: self._ed_call("selectAll"), "Ctrl+A")
+        m_sel.addSeparator()
+        self._act_ed(m_sel, "Mover línea arriba", lambda: self._ed_call("move_lines", False), "Alt+Up")
+        self._act_ed(m_sel, "Mover línea abajo", lambda: self._ed_call("move_lines", True), "Alt+Down")
+        self._act_ed(m_sel, "Duplicar línea", lambda: self._ed_call("duplicate_lines"), "Shift+Alt+Down")
+        self._act_ed(m_sel, "Eliminar línea", lambda: self._ed_call("delete_lines"), "Ctrl+Shift+K")
+
+        # --- Ver ---
+        m_view = bar.addMenu("&Ver")
+        self._act(m_view, "Acercar (zoom +)", self.zoom_in, ["Ctrl+=", "Ctrl++"])
+        self._act(m_view, "Alejar (zoom -)", self.zoom_out, "Ctrl+-")
+        self._act(m_view, "Restablecer zoom", self.zoom_reset, "Ctrl+0")
+        m_view.addSeparator()
+        self._act_ed(m_view, "Alternar explorador", self.toggle_sidebar, "Ctrl+B")
+        self._act_ed(m_view, "Alternar terminal", self.toggle_terminal, "Ctrl+J")
+        self.act_wrap = self._act_ed(m_view, "Ajuste de línea", self.toggle_wrap, "Alt+Z")
+        self.act_wrap.setCheckable(True)
+        m_view.addSeparator()
         self.act_follow = QAction("Seguir archivos que Claude edita", self)
         self.act_follow.setCheckable(True)
         self.act_follow.setChecked(self.follow_enabled)
         self.act_follow.setShortcut(QKeySequence("Ctrl+Shift+F"))
         self.act_follow.toggled.connect(self._set_follow)
         m_view.addAction(self.act_follow)
+
+        # --- Ir ---
+        m_go = bar.addMenu("&Ir")
+        self._act_ed(m_go, "Ir a línea…", self.go_to_line, "Ctrl+G")
+        m_go.addSeparator()
+        self._act(m_go, "Pestaña siguiente", lambda: self._cycle_tab(1), "Ctrl+PgDown")
+        self._act(m_go, "Pestaña anterior", lambda: self._cycle_tab(-1), "Ctrl+PgUp")
+
+        # --- Terminal ---
+        m_term = bar.addMenu("&Terminal")
+        self._act(m_term, "Lanzar claude / reiniciar", self.chat.restart)
+        self._act(m_term, "Mostrar/ocultar terminal", self.toggle_terminal)
+
+        # --- Remoto ---
+        m_remote = bar.addMenu("&Remoto")
+        self._act(m_remote, "Conectar a VPS…", self.show_connections, "Ctrl+Shift+P")
+        self._act(m_remote, "Desconectar (volver a local)", self.disconnect_remote)
+
+        # --- Ayuda ---
+        m_help = bar.addMenu("A&yuda")
+        self._act(m_help, "Documentación de Claude Code",
+                  lambda: QDesktopServices.openUrl(QUrl("https://docs.claude.com/claude-code")))
+        self._act(m_help, "Repositorio de Kodea",
+                  lambda: QDesktopServices.openUrl(QUrl("https://github.com/Maalfer/kodea")))
+        self._act(m_help, "Atajos de teclado", self.show_shortcuts)
+        m_help.addSeparator()
+        self._act(m_help, "Acerca de Kodea", self.show_about)
+
+    # ----------------------------------------------------- helpers de editor
+
+    def _current_editor(self) -> CodeEditor | None:
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, CodeEditor) else None
+
+    def _ed(self) -> CodeEditor | None:
+        w = QApplication.focusWidget()
+        if isinstance(w, CodeEditor):
+            return w
+        return self._current_editor()
+
+    def _ed_call(self, method: str, *args):
+        ed = self._ed()
+        if ed is not None:
+            getattr(ed, method)(*args)
+
+    # --------------------------------------------------------------- zoom
+
+    def _apply_zoom(self):
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, CodeEditor):
+                w.set_font_size(self.editor_font_pt)
+        self.statusBar().showMessage(f"Zoom: {self.editor_font_pt} pt", 1500)
+
+    def zoom_step(self, delta: int):
+        self.editor_font_pt = max(6, min(40, self.editor_font_pt + delta))
+        self._apply_zoom()
+
+    def zoom_in(self):
+        self.zoom_step(1)
+
+    def zoom_out(self):
+        self.zoom_step(-1)
+
+    def zoom_reset(self):
+        from .editor import DEFAULT_FONT_SIZE
+        self.editor_font_pt = DEFAULT_FONT_SIZE
+        self._apply_zoom()
+
+    # ------------------------------------------------------ vista / paneles
+
+    def toggle_sidebar(self):
+        self.sidebar.setVisible(not self.sidebar.isVisible())
+
+    def toggle_terminal(self):
+        self.chat.setVisible(not self.chat.isVisible())
+
+    def toggle_wrap(self, checked: bool):
+        from .editor import CodeEditor as _CE
+        from PySide6.QtWidgets import QPlainTextEdit
+        mode = QPlainTextEdit.WidgetWidth if checked else QPlainTextEdit.NoWrap
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, _CE):
+                w.setLineWrapMode(mode)
+
+    # ------------------------------------------------------ navegación / tabs
+
+    def _cycle_tab(self, step: int):
+        n = self.tabs.count()
+        if n:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % n)
+
+    def close_current_tab(self):
+        if self.tabs.count():
+            self.close_tab(self.tabs.currentIndex())
+
+    def close_all_tabs(self):
+        for i in range(self.tabs.count() - 1, -1, -1):
+            self.close_tab(i)
+
+    def go_to_line(self):
+        ed = self._ed()
+        if ed is None:
+            return
+        total = ed.blockCount()
+        line, ok = QInputDialog.getInt(self, "Ir a línea", f"Línea (1–{total}):",
+                                       ed.textCursor().blockNumber() + 1, 1, total)
+        if ok:
+            block = ed.document().findBlockByNumber(line - 1)
+            cur = ed.textCursor()
+            cur.setPosition(block.position())
+            ed.setTextCursor(cur)
+            ed.centerCursor()
+            ed.setFocus()
+
+    # ------------------------------------------------------------- ayuda
+
+    def show_shortcuts(self):
+        rows = [
+            ("Abrir carpeta", "Ctrl+O"), ("Abrir archivo", "Ctrl+Shift+O"),
+            ("Guardar / Guardar todo", "Ctrl+S / Ctrl+Alt+S"),
+            ("Cerrar pestaña", "Ctrl+W"), ("Buscar / Reemplazar", "Ctrl+F / Ctrl+H"),
+            ("Comentar línea", "Ctrl+/"), ("Mover línea", "Alt+↑ / Alt+↓"),
+            ("Duplicar / Eliminar línea", "Shift+Alt+↓ / Ctrl+Shift+K"),
+            ("Zoom", "Ctrl+ + / Ctrl+ - / Ctrl+0"),
+            ("Explorador / Terminal", "Ctrl+B / Ctrl+J"),
+            ("Ir a línea", "Ctrl+G"), ("Cambiar pestaña", "Ctrl+PgUp / Ctrl+PgDown"),
+            ("Conectar a VPS", "Ctrl+Shift+P"), ("Seguir a Claude", "Ctrl+Shift+F"),
+        ]
+        body = "\n".join(f"{name:<32}{keys}" for name, keys in rows)
+        box = QMessageBox(self)
+        box.setWindowTitle("Atajos de teclado")
+        box.setText("Atajos de Kodea")
+        box.setInformativeText(f"<pre>{body}</pre>")
+        box.exec()
+
+    def show_about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("Acerca de Kodea")
+        box.setIconPixmap(icons.app_pixmap_round(72))
+        box.setText(f"<b>Kodea</b> {__version__}")
+        box.setInformativeText(
+            "Editor de código con Claude Code y SSH integrados.<br><br>"
+            "<a href='https://github.com/Maalfer/kodea'>github.com/Maalfer/kodea</a>")
+        box.exec()
 
     # ------------------------------------------------------------- contexto
 
@@ -378,8 +731,12 @@ class MainWindow(QMainWindow):
         if self.tabs.count() == 1 and not isinstance(self.tabs.widget(0), CodeEditor):
             self.tabs.removeTab(0)
 
-        editor = CodeEditor(path)
+        editor = CodeEditor(path, font_size=self.editor_font_pt)
         editor.fs = self.fs
+        editor.zoom_requested.connect(self.zoom_step)
+        if getattr(self, "act_wrap", None) and self.act_wrap.isChecked():
+            from PySide6.QtWidgets import QPlainTextEdit
+            editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         try:
             editor._mtime = self.fs.mtime(path)
         except Exception:
@@ -450,6 +807,55 @@ class MainWindow(QMainWindow):
         except Exception:
             editor._mtime = None
         self.statusBar().showMessage(f"Guardado {editor.path}", 3000)
+
+    def open_file_dialog(self):
+        if self.fs.is_remote:
+            QMessageBox.information(
+                self, "Abrir archivo",
+                "Con un VPS conectado, abre los archivos desde el explorador.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Abrir archivo", self.workdir or os.path.expanduser("~"))
+        if path:
+            self.open_file(path)
+
+    def save_as(self):
+        ed = self._ed()
+        if ed is None:
+            return
+        if ed.fs.is_remote:
+            new_path, ok = QInputDialog.getText(
+                self, "Guardar como", "Ruta en el servidor:", text=ed.path)
+            if not ok or not new_path:
+                return
+        else:
+            new_path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar como", ed.path or os.path.expanduser("~"))
+            if not new_path:
+                return
+        try:
+            ed.fs.write_text(new_path, ed.toPlainText())
+        except Exception as e:
+            QMessageBox.critical(self, "Error al guardar", f"No se pudo guardar:\n{e}")
+            return
+        ed.path = new_path
+        idx = self.tabs.indexOf(ed)
+        if idx >= 0:
+            name = os.path.basename(new_path)
+            self.tabs.setTabText(idx, name)
+            self.tabs.setTabIcon(idx, icons.file_icon(name))
+            self.tabs.setTabToolTip(idx, f"{ed.fs.label}: {new_path}")
+        ed.document().setModified(False)
+        self.statusBar().showMessage(f"Guardado {new_path}", 3000)
+
+    def save_all(self):
+        saved = 0
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, CodeEditor) and w.document().isModified():
+                self._save_editor(w)
+                saved += 1
+        self.statusBar().showMessage(f"{saved} archivo(s) guardado(s)", 3000)
 
     # ------------------------------------------------------------- claude
 

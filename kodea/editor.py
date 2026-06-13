@@ -146,14 +146,19 @@ class LineNumberArea(QWidget):
         self.editor.paint_line_numbers(event)
 
 
+DEFAULT_FONT_SIZE = 13
+
+
 class CodeEditor(QPlainTextEdit):
     modified_changed = Signal(bool)
+    zoom_requested = Signal(int)  # +1 / -1 con Ctrl + rueda del ratón
 
-    def __init__(self, path: str = "", parent=None):
+    def __init__(self, path: str = "", parent=None, font_size: int = DEFAULT_FONT_SIZE):
         super().__init__(parent)
         self.path = path
+        self._font_pt = font_size
         font = QFont(theme.EDITOR_FONT)
-        font.setPointSize(13)
+        font.setPointSize(font_size)
         font.setStyleHint(QFont.Monospace)
         self.setFont(font)
         self.setTabStopDistance(QFontMetricsF(font).horizontalAdvance(" ") * 4)
@@ -167,7 +172,104 @@ class CodeEditor(QPlainTextEdit):
         self._highlight_current_line()
 
         self.highlighter = Highlighter(self.document(), lang_for_path(path))
+        self.comment_token = self.highlighter.comment_token
         self.document().modificationChanged.connect(self.modified_changed)
+
+    # --- zoom / tamaño de fuente ---
+    def set_font_size(self, pt: int):
+        pt = max(6, min(40, pt))
+        self._font_pt = pt
+        font = self.font()
+        font.setPointSize(pt)
+        self.setFont(font)
+        self.setTabStopDistance(QFontMetricsF(font).horizontalAdvance(" ") * 4)
+        self._update_line_area_width()
+        self._line_area.update()
+
+    def font_size(self) -> int:
+        return self._font_pt
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            self.zoom_requested.emit(1 if event.angleDelta().y() > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    # --- operaciones de línea (estilo VS Code) ---
+    def _line_span(self) -> tuple[int, int]:
+        """(primera, última) línea 0-based cubierta por la selección/cursor."""
+        c = self.textCursor()
+        first = self.document().findBlock(c.selectionStart()).blockNumber()
+        last = self.document().findBlock(c.selectionEnd()).blockNumber()
+        return first, last
+
+    def _apply_lines(self, lines: list[str], cursor_line: int, cursor_col: int = 0):
+        """Reescribe el documento en una sola operación (conserva el undo) y
+        recoloca el cursor."""
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        cur.select(QTextCursor.Document)
+        cur.insertText("\n".join(lines))
+        cur.endEditBlock()
+        line = max(0, min(cursor_line, self.blockCount() - 1))
+        blk = self.document().findBlockByNumber(line)
+        nc = self.textCursor()
+        nc.setPosition(blk.position() + min(cursor_col, len(blk.text())))
+        self.setTextCursor(nc)
+
+    def move_lines(self, down: bool):
+        first, last = self._line_span()
+        lines = self.toPlainText().split("\n")
+        if down and last >= len(lines) - 1:
+            return
+        if not down and first <= 0:
+            return
+        col = self.textCursor().columnNumber()
+        block = lines[first:last + 1]
+        del lines[first:last + 1]
+        dest = first + 1 if down else first - 1
+        lines[dest:dest] = block
+        self._apply_lines(lines, dest, col)
+
+    def duplicate_lines(self):
+        first, last = self._line_span()
+        col = self.textCursor().columnNumber()
+        lines = self.toPlainText().split("\n")
+        block = lines[first:last + 1]
+        lines[last + 1:last + 1] = block
+        self._apply_lines(lines, last + 1, col)
+
+    def delete_lines(self):
+        first, last = self._line_span()
+        lines = self.toPlainText().split("\n")
+        del lines[first:last + 1]
+        if not lines:
+            lines = [""]
+        self._apply_lines(lines, min(first, len(lines) - 1), 0)
+
+    def toggle_comment(self):
+        token = self.comment_token
+        if not token:
+            return
+        first, last = self._line_span()
+        col = self.textCursor().columnNumber()
+        lines = self.toPlainText().split("\n")
+        seg = [lines[i] for i in range(first, last + 1) if lines[i].strip()]
+        commented = bool(seg) and all(l.lstrip().startswith(token) for l in seg)
+        for i in range(first, last + 1):
+            if not lines[i].strip():
+                continue
+            if commented:
+                idx = lines[i].find(token)
+                after = idx + len(token)
+                if lines[i][after:after + 1] == " ":
+                    after += 1
+                lines[i] = lines[i][:idx] + lines[i][after:]
+            else:
+                indent_len = len(lines[i]) - len(lines[i].lstrip())
+                lines[i] = lines[i][:indent_len] + token + " " + lines[i][indent_len:]
+        self._apply_lines(lines, last, col)
 
     # --- números de línea ---
     def line_number_width(self) -> int:
