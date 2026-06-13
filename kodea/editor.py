@@ -5,6 +5,7 @@ import re
 
 from PySide6.QtCore import QRect, QSize, QStringListModel, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QFontMetricsF,
@@ -344,6 +345,17 @@ class LineNumberArea(QWidget):
 DEFAULT_FONT_SIZE = 13
 
 
+# Acciones de IA sobre la selección (clave interna, etiqueta visible)
+AI_ACTIONS = [
+    ("explain", "Explica esto"),
+    ("refactor", "Refactoriza"),
+    ("tests", "Escribe tests"),
+    ("document", "Documenta"),
+    ("bugs", "Busca bugs"),
+    ("ask", "Preguntar a Claude…"),
+]
+
+
 class ReviewBar(QFrame):
     """Tarjeta flotante que avisa de los cambios de Claude (ya aplicados) y
     permite navegarlos o deshacerlos."""
@@ -390,6 +402,7 @@ class CodeEditor(QPlainTextEdit):
     modified_changed = Signal(bool)
     zoom_requested = Signal(int)  # +1 / -1 con Ctrl + rueda del ratón
     change_undo = Signal()        # deshacer el último lote de cambios de Claude
+    ai_action = Signal(str)       # acción de IA sobre la selección (clave)
 
     def __init__(self, path: str = "", parent=None, font_size: int = DEFAULT_FONT_SIZE):
         super().__init__(parent)
@@ -567,6 +580,20 @@ class CodeEditor(QPlainTextEdit):
             event.accept()
             return
         super().wheelEvent(event)
+
+    # --- menú contextual con acciones de IA ---
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        first = menu.actions()[0] if menu.actions() else None
+        header = QAction("✦ Claude", menu)
+        header.setEnabled(False)
+        menu.insertAction(first, header)
+        for key, label in AI_ACTIONS:
+            act = QAction(label, menu)
+            act.triggered.connect(lambda _=False, k=key: self.ai_action.emit(k))
+            menu.insertAction(first, act)
+        menu.insertSeparator(first)
+        menu.exec(event.globalPos())
 
     # --- operaciones de línea (estilo VS Code) ---
     def _line_span(self) -> tuple[int, int]:

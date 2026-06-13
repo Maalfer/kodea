@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 from . import __version__, icons
 from .terminal import ClaudeTerminalPanel
 from .connections import Connection, ConnectionDialog, ConnectionStore
-from .editor import CodeEditor, lang_for_path
+from .editor import AI_ACTIONS, CodeEditor, lang_for_path
 from .file_tree import FileTree, SKIP
 from .fs import FileSystem, LocalFS, RemoteFS
 
@@ -487,6 +487,16 @@ class MainWindow(QMainWindow):
         self._act_ed(m_sel, "Duplicar línea", lambda: self._ed_call("duplicate_lines"), "Shift+Alt+Down")
         self._act_ed(m_sel, "Eliminar línea", lambda: self._ed_call("delete_lines"), "Ctrl+Shift+K")
 
+        # --- IA (Claude) ---
+        m_ai = bar.addMenu("&IA")
+        self._act_ed(m_ai, "Explica la selección", lambda: self._run_ai_action("explain"), "Ctrl+I")
+        self._act_ed(m_ai, "Refactoriza la selección", lambda: self._run_ai_action("refactor"))
+        self._act_ed(m_ai, "Escribe tests", lambda: self._run_ai_action("tests"))
+        self._act_ed(m_ai, "Documenta", lambda: self._run_ai_action("document"))
+        self._act_ed(m_ai, "Busca bugs", lambda: self._run_ai_action("bugs"))
+        m_ai.addSeparator()
+        self._act_ed(m_ai, "Preguntar a Claude…", lambda: self._run_ai_action("ask"), "Ctrl+Shift+I")
+
         # --- Ver ---
         m_view = bar.addMenu("&Ver")
         self._act(m_view, "Acercar (zoom +)", self.zoom_in, ["Ctrl+=", "Ctrl++"])
@@ -548,6 +558,60 @@ class MainWindow(QMainWindow):
         ed = self._ed()
         if ed is not None:
             getattr(ed, method)(*args)
+
+    # ----------------------------------------------------- acciones de IA
+
+    def _claude_path_ref(self, path: str) -> str:
+        """Referencia al archivo para el prompt (ruta relativa si es local)."""
+        if self.connection is not None:
+            return f"`{path}` (en el servidor)"
+        try:
+            rel = os.path.relpath(path, self.workdir) if self.workdir else path
+        except ValueError:
+            rel = path
+        return f"`{path if rel.startswith('..') else rel}`"
+
+    @staticmethod
+    def _ai_prompt(key: str, ref: str, rng: str) -> str:
+        return {
+            "explain": f"Explica qué hace el código de {ref} en {rng}. No cambies nada, "
+                       f"solo explícamelo.",
+            "refactor": f"Refactoriza el código de {ref} en {rng} para que sea más limpio y "
+                        f"legible manteniendo el comportamiento, y aplica los cambios.",
+            "tests": f"Escribe tests para el código de {ref} en {rng}.",
+            "document": f"Añade comentarios y documentación al código de {ref} en {rng} "
+                        f"y aplica los cambios.",
+            "bugs": f"Revisa el código de {ref} en {rng} en busca de bugs, errores o "
+                    f"problemas y dime qué encuentras.",
+        }[key]
+
+    def _run_ai_action(self, key: str, ed: CodeEditor | None = None):
+        ed = ed or self._ed()
+        if ed is None:
+            return
+        if not self.workdir:
+            QMessageBox.information(
+                self, "Claude",
+                "Abre una carpeta o conéctate a un VPS para usar las acciones de IA "
+                "(Claude debe estar en marcha en el terminal).")
+            return
+        cur = ed.textCursor()
+        doc = ed.document()
+        a = doc.findBlock(cur.selectionStart()).blockNumber() + 1
+        b = doc.findBlock(cur.selectionEnd()).blockNumber() + 1
+        rng = f"la línea {a}" if a == b else f"las líneas {a}-{b}"
+        ref = self._claude_path_ref(ed.path)
+        if key == "ask":
+            text, ok = QInputDialog.getMultiLineText(
+                self, "Preguntar a Claude", f"Tu pregunta sobre {ref} ({rng}):", "")
+            if not ok or not text.strip():
+                return
+            prompt = f"Sobre {ref} en {rng}: {text.strip()}"
+        else:
+            prompt = self._ai_prompt(key, ref, rng)
+        self.chat.setVisible(True)
+        self.chat.send_to_claude(prompt)
+        self.statusBar().showMessage("✦ Enviado a Claude", 3000)
 
     # --------------------------------------------------------------- zoom
 
@@ -755,6 +819,7 @@ class MainWindow(QMainWindow):
         editor.fs = self.fs
         editor.zoom_requested.connect(self.zoom_step)
         editor.change_undo.connect(lambda ed=editor: self._undo_change(ed))
+        editor.ai_action.connect(lambda key, ed=editor: self._run_ai_action(key, ed))
         if getattr(self, "act_wrap", None) and self.act_wrap.isChecked():
             from PySide6.QtWidgets import QPlainTextEdit
             editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)

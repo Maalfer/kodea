@@ -256,6 +256,15 @@ class ClaudeTerminalPanel(QWidget):
         cwd = self.workdir if (self.workdir and not self.connection) else os.path.expanduser("~")
         self.term.start_shell(cwd)
 
+    def send_to_claude(self, text: str, submit: bool = True):
+        """Teclea `text` en la sesión de Claude del terminal y lo envía.
+        El Enter se manda con un pequeño retardo para que la TUI registre
+        primero todo el texto."""
+        self.term.write_pty(text)
+        self.term.setFocus()
+        if submit:
+            QTimer.singleShot(80, lambda: self.term.write_pty("\r"))
+
     def bridge_message(self, text: str):
         self.term.bridge.output.emit(base64.b64encode(text.encode()).decode("ascii"))
 
