@@ -15,6 +15,7 @@ class FSEntry:
     name: str
     path: str
     is_dir: bool
+    mtime: float = 0.0
 
 
 class FileSystem:
@@ -36,6 +37,13 @@ class FileSystem:
     def mtime(self, path: str) -> float:
         raise NotImplementedError
 
+    def scan_tree(self, root: str, skip, is_watchable) -> dict[str, float]:
+        """Recorre el árbol bajo `root` y devuelve {ruta: mtime} de los
+        archivos de texto. Pensado para ejecutarse en un hilo de trabajo
+        (no toca la UI). `skip` es un set de nombres a ignorar y
+        `is_watchable(name)` filtra por extensión."""
+        raise NotImplementedError
+
     def close(self):
         pass
 
@@ -50,13 +58,14 @@ class LocalFS(FileSystem):
 
     def listdir(self, path: str) -> list[FSEntry]:
         out = []
-        for name in os.listdir(path):
-            full = os.path.join(path, name)
-            try:
-                is_dir = os.path.isdir(full)
-            except OSError:
-                continue
-            out.append(FSEntry(name, full, is_dir))
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    is_dir = entry.is_dir()
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                out.append(FSEntry(entry.name, entry.path, is_dir, mtime))
         return _sorted_entries(out)
 
     def read_text(self, path: str) -> str:
@@ -69,6 +78,31 @@ class LocalFS(FileSystem):
 
     def mtime(self, path: str) -> float:
         return os.path.getmtime(path)
+
+    def scan_tree(self, root: str, skip, is_watchable) -> dict[str, float]:
+        out: dict[str, float] = {}
+        stack = [root]
+        count = 0
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if entry.name in skip:
+                            continue
+                        try:
+                            if entry.is_dir():
+                                stack.append(entry.path)
+                            elif is_watchable(entry.name):
+                                out[entry.path] = entry.stat().st_mtime
+                                count += 1
+                        except OSError:
+                            continue
+                        if count >= 8000:
+                            return out
+            except OSError:
+                continue
+        return out
 
 
 class RemoteFS(FileSystem):
@@ -100,13 +134,17 @@ class RemoteFS(FileSystem):
         kwargs["look_for_keys"] = True
         self.client.connect(**kwargs)
         self.sftp = self.client.open_sftp()
+        # canal SFTP independiente para el escaneo en segundo plano, de modo
+        # que no colisione con el SFTP que usa la UI (paramiko permite varios
+        # canales sobre el mismo transporte)
+        self._scan_sftp = None
 
     def listdir(self, path: str) -> list[FSEntry]:
         out = []
         for attr in self.sftp.listdir_attr(path):
             full = path.rstrip("/") + "/" + attr.filename
             is_dir = stat.S_ISDIR(attr.st_mode)
-            out.append(FSEntry(attr.filename, full, is_dir))
+            out.append(FSEntry(attr.filename, full, is_dir, attr.st_mtime or 0.0))
         return _sorted_entries(out)
 
     def read_text(self, path: str) -> str:
@@ -120,12 +158,43 @@ class RemoteFS(FileSystem):
     def mtime(self, path: str) -> float:
         return self.sftp.stat(path).st_mtime or 0.0
 
+    def scan_tree(self, root: str, skip, is_watchable) -> dict[str, float]:
+        if self._scan_sftp is None:
+            self._scan_sftp = self.client.open_sftp()
+        sftp = self._scan_sftp
+        out: dict[str, float] = {}
+        stack = [root]
+        count = 0
+        while stack:
+            d = stack.pop()
+            try:
+                attrs = sftp.listdir_attr(d)
+            except Exception:
+                continue
+            for a in attrs:
+                if a.filename in skip:
+                    continue
+                full = d.rstrip("/") + "/" + a.filename
+                if stat.S_ISDIR(a.st_mode):
+                    stack.append(full)
+                elif is_watchable(a.filename):
+                    out[full] = a.st_mtime or 0.0
+                    count += 1
+                    if count >= 8000:
+                        return out
+        return out
+
     def home_dir(self) -> str:
         return self.sftp.normalize(".")
 
     def close(self):
+        for ch in (getattr(self, "_scan_sftp", None), self.sftp):
+            try:
+                if ch is not None:
+                    ch.close()
+            except Exception:
+                pass
         try:
-            self.sftp.close()
             self.client.close()
         except Exception:
             pass

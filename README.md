@@ -5,6 +5,7 @@ Editor de código de escritorio (PySide6) estilo VS Code con **tu terminal del s
 ## Características
 
 - **Editor**: pestañas, números de línea, resaltado de sintaxis (Python, JS/TS, PHP, Go, Ruby, shell…), tema oscuro Dark+, autoindentado, guardado con ⌘S. Si Claude (o cualquier proceso) modifica un fichero abierto, la pestaña se recarga sola.
+- **Follow mode**: mientras Claude trabaja, Kodea detecta el archivo que edita o crea, lo abre como pestaña activa, lo selecciona en el explorador y salta a la línea del cambio — sin robarte el foco del terminal. Se activa/desactiva en `Ver → Seguir archivos que Claude edita` (⌘⇧F) y funciona tanto en local como por SSH.
 - **Terminal integrada al 100%**: el panel derecho es un terminal real (xterm.js + pty) con tu shell de login — tu zsh, tu prompt, tu PATH. Al abrir un proyecto, Kodea ejecuta `claude` dentro de esa shell y tienes la TUI completa de Claude Code: permisos interactivos, `/comandos`, `Shift+Tab`, colores… Al salir de claude sigues en tu terminal y puedes ejecutar lo que quieras.
 - **SSH a VPS**: define conexiones (host, usuario, clave, directorio). El explorador y el editor funcionan por SFTP. Claude es siempre **tu Claude Code local** (tu sesión de este equipo): con una conexión activa recibe el comando ssh de esa conexión y opera sobre el servidor a través de él (leer, editar y ejecutar en remoto). No hace falta instalar `claude` en el VPS.
 

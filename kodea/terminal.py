@@ -242,7 +242,12 @@ class ClaudeTerminalPanel(QWidget):
         self.mode_combo = QComboBox()
         for label, value in PERMISSION_MODES:
             self.mode_combo.addItem(label, value)
-        self.mode_combo.setToolTip("Modo de permisos con el que se lanza claude (al relanzar)")
+        self.mode_combo.setToolTip(
+            "Modo de permisos de claude. Al cambiarlo se cierra la sesión actual "
+            "y se relanza claude con ese modo.")
+        # cambiar el modo relanza claude con esa configuración (se conecta
+        # después de poblar el combo para que la carga inicial no lo dispare)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         row.addWidget(self.mode_combo, 1)
         self.claude_btn = QPushButton("Lanzar claude")
         self.claude_btn.setToolTip("Abre una shell nueva y ejecuta claude en el contexto actual")
@@ -277,6 +282,13 @@ class ClaudeTerminalPanel(QWidget):
                     f"{self.connection.display}\nexec {shlex.join(cmd)}\n")
         os.chmod(SCRIPT_PATH, 0o700)
         return SCRIPT_PATH, cwd
+
+    def _on_mode_changed(self, _index: int):
+        """Al elegir otro modo de permisos, cierra la sesión de claude actual
+        y la relanza con ese modo. Solo si hay un proyecto/VPS abierto (es
+        cuando claude está corriendo); si no, el modo se aplicará al lanzarlo."""
+        if self.workdir:
+            self.restart()
 
     def restart(self):
         """Shell nueva en el contexto actual con claude ejecutándose dentro."""

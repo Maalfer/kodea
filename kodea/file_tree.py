@@ -90,3 +90,38 @@ class FileTree(QTreeWidget):
         path = item.data(0, ROLE_PATH)
         if path and not item.data(0, ROLE_IS_DIR):
             self.file_activated.emit(path)
+
+    # ------------------------------------------------ revelar una ruta
+
+    def _child_for_path(self, parent: QTreeWidgetItem, path: str):
+        for i in range(parent.childCount()):
+            child = parent.child(i)
+            if child.data(0, ROLE_PATH) == path:
+                return child
+        return None
+
+    def reveal(self, path: str):
+        """Despliega los directorios necesarios y selecciona el archivo
+        `path`, cargándolos de forma perezosa si hace falta."""
+        if not self.fs or not self.root_path:
+            return
+        root = self.root_path.rstrip("/")
+        target = path.rstrip("/")
+        if target == root or not target.startswith(root + "/"):
+            return
+        rel = target[len(root) + 1:]
+        parent = self.invisibleRootItem()
+        cur = root
+        parts = rel.split("/")
+        for i, part in enumerate(parts):
+            cur = cur + "/" + part
+            child = self._child_for_path(parent, cur)
+            if child is None:
+                return
+            if i == len(parts) - 1:
+                self.setCurrentItem(child)
+                self.scrollToItem(child)
+            else:
+                if not child.isExpanded():
+                    child.setExpanded(True)  # dispara la carga perezosa de hijos
+                parent = child

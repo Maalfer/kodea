@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -27,8 +26,84 @@ from . import icons
 from .terminal import ClaudeTerminalPanel
 from .connections import Connection, ConnectionDialog, ConnectionStore
 from .editor import CodeEditor, lang_for_path
-from .file_tree import FileTree
+from .file_tree import FileTree, SKIP
 from .fs import FileSystem, LocalFS, RemoteFS
+
+# Extensiones que no tiene sentido seguir/abrir como texto.
+_BINARY_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff",
+    ".pdf", ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac", ".ogg",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".class", ".jar", ".o", ".a",
+    ".bin", ".exe", ".wasm", ".db", ".sqlite", ".sqlite3", ".lock",
+}
+
+
+def _is_watchable(name: str) -> bool:
+    """¿Es un archivo de texto/código que tiene sentido seguir y abrir?"""
+    return os.path.splitext(name)[1].lower() not in _BINARY_EXT
+
+
+def _first_diff_line(old: str, new: str) -> int:
+    """Primera línea (0-based) que difiere entre dos textos."""
+    a, b = old.split("\n"), new.split("\n")
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            return i
+    return max(0, min(len(a), len(b)) - 1)
+
+
+# --------------------------------------------------------------- tareas en 2º plano
+# Toda la E/S que puede bloquear (conectar por SSH, recorrer el árbol remoto por
+# SFTP) se ejecuta en el QThreadPool para que la ventana no se congele.
+
+class _ConnectSignals(QObject):
+    ok = Signal(object, str)   # (FileSystem, workdir)
+    err = Signal(str)
+
+
+class _ConnectTask(QRunnable):
+    """Abre la conexión SSH/SFTP fuera del hilo de la GUI."""
+
+    def __init__(self, conn: Connection):
+        super().__init__()
+        self.setAutoDelete(False)  # el ciclo de vida lo gestiona MainWindow._tasks
+        self.conn = conn
+        self.signals = _ConnectSignals()
+
+    def run(self):
+        try:
+            fs = RemoteFS(self.conn)
+            workdir = self.conn.remote_dir or fs.home_dir()
+        except Exception as e:  # noqa: BLE001 — se reporta tal cual en la UI
+            self.signals.err.emit(str(e))
+            return
+        self.signals.ok.emit(fs, workdir)
+
+
+class _ScanSignals(QObject):
+    done = Signal(object, dict)  # (fs que se escaneó, {ruta: mtime})
+    failed = Signal()
+
+
+class _ScanTask(QRunnable):
+    """Recorre el árbol del proyecto (local o remoto) fuera del hilo de la GUI."""
+
+    def __init__(self, fs: FileSystem, root: str):
+        super().__init__()
+        self.setAutoDelete(False)  # el ciclo de vida lo gestiona MainWindow._tasks
+        self.fs = fs
+        self.root = root
+        self.signals = _ScanSignals()
+
+    def run(self):
+        try:
+            snapshot = self.fs.scan_tree(self.root, SKIP, _is_watchable)
+        except Exception:  # noqa: BLE001 — un fallo de red no debe tumbar nada
+            self.signals.failed.emit()
+            return
+        self.signals.done.emit(self.fs, snapshot)
 
 
 class WelcomeWidget(QWidget):
@@ -36,7 +111,11 @@ class WelcomeWidget(QWidget):
 
     def __init__(self, open_folder_cb, connect_cb, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: #1e1e1e;")
+        # El fondo se pinta solo en este widget (no en las QLabel hijas, que
+        # de lo contrario aparecerían como bandas más claras).
+        self.setObjectName("welcome")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("#welcome { background: #1e1e1e; }")
         outer = QVBoxLayout(self)
         outer.addStretch(2)
 
@@ -71,12 +150,13 @@ class WelcomeWidget(QWidget):
         outer.addLayout(btn_row)
 
         keys = QLabel(
-            "⌘O&nbsp;&nbsp;Abrir carpeta&nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp;"
-            "⌘⇧P&nbsp;&nbsp;Conectar a VPS&nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp;"
-            "⌘S&nbsp;&nbsp;Guardar&nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp;"
-            "⌘R&nbsp;&nbsp;Recargar explorador"
+            "⌘O  Abrir carpeta     ·     "
+            "⌘⇧P  Conectar a VPS     ·     "
+            "⌘S  Guardar     ·     "
+            "⌘R  Recargar explorador"
         )
         keys.setAlignment(Qt.AlignCenter)
+        keys.setWordWrap(True)
         keys.setStyleSheet("font-size: 12px; color: #6e7681; padding-top: 26px;")
         outer.addWidget(keys)
         outer.addStretch(3)
@@ -94,11 +174,24 @@ class MainWindow(QMainWindow):
         self.connection: Connection | None = None
         self.workdir = ""
 
+        # «follow mode»: seguir los archivos que Claude edita
+        self.follow_enabled = True
+        self._fs_snapshot: dict[str, float] = {}
+        self._primed = False
+        self._scanning = False  # hay un escaneo en curso (evita solaparlos)
+        # referencias vivas a las tareas en segundo plano: sin esto Python
+        # recolecta el QRunnable y su objeto de señales, y emitir desde el
+        # hilo de trabajo accede a un QObject destruido (crash)
+        self._tasks: set = set()
+
         # --- layout: [explorador | editor | chat] ---
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(1)
+        splitter.setChildrenCollapsible(False)
         self.setCentralWidget(splitter)
 
         sidebar = QWidget()
+        sidebar.setMinimumWidth(180)
         sl = QVBoxLayout(sidebar)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
@@ -115,6 +208,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(sidebar)
 
         self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(320)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
@@ -125,10 +219,13 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.tabs)
 
         self.chat = ClaudeTerminalPanel()
+        self.chat.setMinimumWidth(360)
         splitter.addWidget(self.chat)
 
         splitter.setSizes([240, 700, 540])
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 0)  # explorador: ancho fijo
+        splitter.setStretchFactor(1, 1)  # editor: absorbe el espacio extra
+        splitter.setStretchFactor(2, 0)  # terminal: ancho fijo
 
         # barra de estado: conexión a la izquierda, cursor/lenguaje a la derecha
         self.conn_status = QLabel("⬤ Local")
@@ -139,10 +236,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.cursor_status)
         self._build_menu()
 
-        # vigila cambios externos (p. ej. ediciones de Claude) en los ficheros abiertos
+        # vigila el proyecto: recarga las pestañas abiertas que Claude modifique
+        # y revela el archivo recién editado (follow mode)
         self.watch_timer = QTimer(self)
-        self.watch_timer.setInterval(3000)
-        self.watch_timer.timeout.connect(self._check_external_changes)
+        self.watch_timer.setInterval(1500)
+        self.watch_timer.timeout.connect(self._scan_changes)
         self.watch_timer.start()
 
     # ------------------------------------------------------------- menú
@@ -171,6 +269,14 @@ class MainWindow(QMainWindow):
         act_disconnect.triggered.connect(self.disconnect_remote)
         m_remote.addAction(act_disconnect)
 
+        m_view = self.menuBar().addMenu("Ver")
+        self.act_follow = QAction("Seguir archivos que Claude edita", self)
+        self.act_follow.setCheckable(True)
+        self.act_follow.setChecked(self.follow_enabled)
+        self.act_follow.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.act_follow.toggled.connect(self._set_follow)
+        m_view.addAction(self.act_follow)
+
     # ------------------------------------------------------------- contexto
 
     def open_local_folder(self):
@@ -184,20 +290,27 @@ class MainWindow(QMainWindow):
             self.connect_remote(dlg.selected)
 
     def connect_remote(self, conn: Connection):
+        # la conexión SSH puede tardar; se hace en segundo plano para no
+        # congelar la ventana
         self.statusBar().showMessage(f"Conectando a {conn.display}…")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            fs = RemoteFS(conn)
-        except Exception as e:
-            QMessageBox.critical(self, "Error de conexión", f"No se pudo conectar a {conn.display}:\n{e}")
-            self.statusBar().showMessage("Error de conexión")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        workdir = conn.remote_dir or fs.home_dir()
+        self.conn_status.setText(f"⬤ Conectando a {conn.display}…")
+        task = _ConnectTask(conn)
+        self._tasks.add(task)
+        task.signals.ok.connect(lambda fs, wd, t=task, c=conn: self._on_connected(fs, wd, c, t))
+        task.signals.err.connect(lambda msg, t=task, c=conn: self._on_connect_error(msg, c, t))
+        QThreadPool.globalInstance().start(task)
+
+    def _on_connected(self, fs: FileSystem, workdir: str, conn: Connection, task=None):
+        self._tasks.discard(task)
         self._set_context(fs, workdir, conn)
         self.statusBar().showMessage(f"Conectado a {conn.display}")
+
+    def _on_connect_error(self, msg: str, conn: Connection, task=None):
+        self._tasks.discard(task)
+        QMessageBox.critical(self, "Error de conexión",
+                             f"No se pudo conectar a {conn.display}:\n{msg}")
+        self.statusBar().showMessage("Error de conexión")
+        self.conn_status.setText("⬤ Local")
 
     def disconnect_remote(self):
         if self.connection:
@@ -205,9 +318,18 @@ class MainWindow(QMainWindow):
             self.connection = None
             self.fs = LocalFS()
             self.workdir = ""
+            self._fs_snapshot = {}
+            self._primed = False
+            self._scanning = False
             self.tree.clear()
             self.context_label.setText("Abre una carpeta o conéctate a un VPS")
             self.statusBar().showMessage("Desconectado")
+
+    def _set_follow(self, enabled: bool):
+        self.follow_enabled = enabled
+        self.statusBar().showMessage(
+            "Follow mode activado — sigo los archivos que edita Claude" if enabled
+            else "Follow mode desactivado", 3000)
 
     def _set_context(self, fs: FileSystem, workdir: str, conn: Connection | None):
         if self.connection and fs is not self.fs:
@@ -215,6 +337,12 @@ class MainWindow(QMainWindow):
         self.fs = fs
         self.workdir = workdir
         self.connection = conn
+        # nueva base de referencia para el escaneo (no revelar todo de golpe)
+        self._fs_snapshot = {}
+        self._primed = False
+        self._scanning = False
+        # el escaneo recursivo por SFTP es más caro: hazlo algo más espaciado
+        self.watch_timer.setInterval(2500 if fs.is_remote else 1500)
         where = f"🌐 {conn.display}" if conn else "💻 Local"
         self.context_label.setText(f"{where}\n{workdir}")
         self.tree.set_root(fs, workdir)
@@ -227,13 +355,19 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- pestañas
 
-    def open_file(self, path: str):
-        # ¿ya está abierta?
+    def _tab_for_path(self, path: str) -> int | None:
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, CodeEditor) and w.path == path and w.fs is self.fs:
-                self.tabs.setCurrentIndex(i)
-                return
+                return i
+        return None
+
+    def open_file(self, path: str, focus: bool = True):
+        # ¿ya está abierta?
+        existing = self._tab_for_path(path)
+        if existing is not None:
+            self.tabs.setCurrentIndex(existing)
+            return
         try:
             content = self.fs.read_text(path)
         except Exception as e:
@@ -258,7 +392,8 @@ class MainWindow(QMainWindow):
         editor.modified_changed.connect(lambda mod, ed=editor: self._mark_modified(ed, mod))
         editor.cursorPositionChanged.connect(self._update_cursor_status)
         self._update_cursor_status()
-        editor.setFocus()
+        if focus:
+            editor.setFocus()
 
     def _update_cursor_status(self):
         if not hasattr(self, "cursor_status"):
@@ -308,41 +443,114 @@ class MainWindow(QMainWindow):
         editor.document().setModified(False)
         try:
             editor._mtime = editor.fs.mtime(editor.path)
+            # registra el mtime para que el guardado propio no se interprete
+            # como una edición externa de Claude
+            self._fs_snapshot[editor.path] = editor._mtime
         except Exception:
             editor._mtime = None
         self.statusBar().showMessage(f"Guardado {editor.path}", 3000)
 
     # ------------------------------------------------------------- claude
 
-    def _check_external_changes(self):
-        """Recarga los ficheros abiertos sin cambios propios si alguien
-        (normalmente Claude) los ha modificado por debajo."""
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if not isinstance(w, CodeEditor) or w.document().isModified():
-                continue
-            try:
-                m = w.fs.mtime(w.path)
-            except Exception:
-                continue
-            if m == getattr(w, "_mtime", None):
-                continue
-            try:
-                fresh = w.fs.read_text(w.path)
-            except Exception:
-                continue
-            w._mtime = m
-            if fresh != w.toPlainText():
-                pos = w.textCursor().position()
-                scroll = w.verticalScrollBar().value()
-                w.setPlainText(fresh)
-                cursor = w.textCursor()
-                cursor.setPosition(min(pos, len(fresh)))
-                w.setTextCursor(cursor)
-                w.verticalScrollBar().setValue(scroll)
-                w.document().setModified(False)
-                self.statusBar().showMessage(
-                    f"♻ Recargado {os.path.basename(w.path)} (modificado externamente)", 4000)
+    def _scan_changes(self):
+        """Lanza un escaneo del proyecto en segundo plano (no bloquea la UI).
+        Si ya hay uno en curso, se salta este tick para no encolar trabajo."""
+        if not self.workdir or self._scanning:
+            return
+        self._scanning = True
+        task = _ScanTask(self.fs, self.workdir)
+        self._tasks.add(task)
+        task.signals.done.connect(lambda fs, snap, t=task: self._on_scan_done(fs, snap, t))
+        task.signals.failed.connect(lambda t=task: self._on_scan_failed(t))
+        QThreadPool.globalInstance().start(task)
+
+    def _on_scan_failed(self, task=None):
+        self._tasks.discard(task)
+        self._scanning = False
+
+    def _on_scan_done(self, scanned_fs: FileSystem, snapshot: dict, task=None):
+        self._tasks.discard(task)
+        """Procesa (en el hilo de la GUI) el resultado del escaneo: recarga las
+        pestañas abiertas que cambiaron y revela el archivo recién editado."""
+        self._scanning = False
+        # si cambiamos de carpeta/conexión mientras escaneaba, descarta
+        if scanned_fs is not self.fs:
+            return
+        prev = self._fs_snapshot
+        if not self._primed:
+            # primer escaneo tras abrir/conectar: solo fija la línea base
+            self._fs_snapshot = snapshot
+            self._primed = True
+            return
+        changed = [p for p, m in snapshot.items() if m > prev.get(p, 0.0)]
+        self._fs_snapshot = snapshot
+        if not changed:
+            return
+        newest = max(changed, key=lambda p: snapshot[p]) if self.follow_enabled else None
+        for p in changed:
+            self._reload_if_open(p, jump=(p == newest))
+        if newest is not None:
+            self._reveal_file(newest)
+
+    def _reload_if_open(self, path: str, jump: bool = False):
+        """Recarga la pestaña de `path` si está abierta y sin cambios propios.
+        Con `jump`, salta a la primera línea modificada; si no, conserva la
+        posición y el scroll actuales."""
+        idx = self._tab_for_path(path)
+        if idx is None:
+            return
+        w = self.tabs.widget(idx)
+        if w.document().isModified():
+            return
+        try:
+            m = w.fs.mtime(path)
+        except Exception:
+            return
+        if m == getattr(w, "_mtime", None):
+            return
+        try:
+            fresh = w.fs.read_text(path)
+        except Exception:
+            return
+        w._mtime = m
+        self._fs_snapshot[path] = m
+        if fresh == w.toPlainText():
+            return
+        if jump:
+            line = _first_diff_line(w.toPlainText(), fresh)
+            w.setPlainText(fresh)
+            block = w.document().findBlockByNumber(line)
+            cursor = w.textCursor()
+            cursor.setPosition(block.position() if block.isValid() else 0)
+            w.setTextCursor(cursor)
+            w.centerCursor()
+        else:
+            pos = w.textCursor().position()
+            scroll = w.verticalScrollBar().value()
+            w.setPlainText(fresh)
+            cursor = w.textCursor()
+            cursor.setPosition(min(pos, len(fresh)))
+            w.setTextCursor(cursor)
+            w.verticalScrollBar().setValue(scroll)
+        w.document().setModified(False)
+        self.statusBar().showMessage(
+            f"♻ {os.path.basename(path)} actualizado por Claude", 4000)
+
+    def _reveal_file(self, path: str):
+        """Trae al frente (y abre si hace falta) el archivo editado por Claude,
+        sin robar el foco del terminal, y lo selecciona en el explorador."""
+        idx = self._tab_for_path(path)
+        if idx is None:
+            if not _is_watchable(os.path.basename(path)):
+                return
+            self.open_file(path, focus=False)
+            idx = self._tab_for_path(path)
+            if idx is None:
+                return  # no se pudo abrir (binario, error de lectura…)
+        self.tabs.setCurrentIndex(idx)
+        self.tree.reveal(path)
+        self.statusBar().showMessage(
+            f"➜ {os.path.basename(path)} (editado por Claude)", 4000)
 
     # ------------------------------------------------------------- cierre
 
