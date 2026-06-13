@@ -31,6 +31,12 @@ from . import theme
 
 
 # ---------------------------------------------------------------- sintaxis
+#
+# Resaltado por *tokenizador con contexto* (no solo regex sueltas): distingue
+# definiciones de función de llamadas, clases/tipos, constantes, decoradores,
+# números, y maneja comentarios y cadenas (incluidas las multilínea) con estado
+# por bloque. Pensado para que Python, JavaScript/TS, Java, PHP, Go, Ruby, C/C++
+# y shell se lean como en VS Code.
 
 def _fmt(color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
     f = QTextCharFormat()
@@ -43,63 +49,124 @@ def _fmt(color: str, bold: bool = False, italic: bool = False) -> QTextCharForma
 
 
 # Colores VS Code Dark+
-C_KEYWORD = "#569cd6"
-C_CONTROL = "#c586c0"
-C_STRING = "#ce9178"
-C_COMMENT = "#6a9955"
-C_NUMBER = "#b5cea8"
-C_FUNC = "#dcdcaa"
-C_TYPE = "#4ec9b0"
-C_DECOR = "#dcdcaa"
+C_KEYWORD = "#569cd6"    # palabras clave (def, class, var, public…)
+C_CONTROL = "#c586c0"    # control de flujo (if, for, return…)
+C_STRING = "#ce9178"     # cadenas
+C_COMMENT = "#6a9955"    # comentarios
+C_NUMBER = "#b5cea8"     # números
+C_FUNC = "#dcdcaa"       # funciones (definición y llamada)
+C_TYPE = "#4ec9b0"       # clases / tipos
+C_CONST = "#569cd6"      # constantes (True/False/None/null…)
+C_DECOR = "#dcdcaa"      # decoradores / anotaciones
+C_VAR = "#9cdcfe"        # variables ($var, etc.)
 
-LANG_KEYWORDS = {
-    "python": {
-        "keywords": "def lambda class global nonlocal del pass import from as with async await "
-                    "True False None and or not in is",
-        "control": "if elif else for while break continue return yield try except finally raise assert match case",
-        "comment": "#",
-        "decorator": r"@\w+",
-    },
-    "javascript": {
-        "keywords": "function var let const class extends new this typeof instanceof in of "
-                    "true false null undefined async await import export from default delete void",
-        "control": "if else for while do break continue return switch case try catch finally throw yield",
-        "comment": "//",
-    },
-    "php": {
-        "keywords": "function class extends implements new echo print var const public private protected "
-                    "static abstract final namespace use true false null and or xor instanceof",
-        "control": "if elseif else for foreach while do break continue return switch case try catch finally throw",
-        "comment": "//",
-    },
-    "shell": {
-        "keywords": "export local readonly declare function alias source",
-        "control": "if then elif else fi for while until do done case esac break continue return exit",
-        "comment": "#",
-    },
-    "ruby": {
-        "keywords": "def class module require include attr_accessor true false nil self new lambda proc",
-        "control": "if elsif else unless end for while until do break next return begin rescue ensure raise case when",
-        "comment": "#",
-    },
-    "go": {
-        "keywords": "func var const type struct interface map chan package import go defer "
-                    "true false nil make new len cap append",
-        "control": "if else for range switch case break continue return select fallthrough goto",
-        "comment": "//",
-    },
+_WORD_RE = re.compile(r"[@$]?[A-Za-z_][A-Za-z0-9_]*")
+_NUM_RE = re.compile(
+    r"0[xXbBoO][0-9a-fA-F_]+|\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?")
+
+
+def _spec(*, keywords="", control="", constants="", types="",
+          line_comments=(), multiline=(), quotes="'\"",
+          func_def="", class_kw="", decorator=False, dollar_vars=False):
+    return {
+        "keywords": set(keywords.split()),
+        "control": set(control.split()),
+        "constants": set(constants.split()),
+        "types": set(types.split()),
+        "line_comments": list(line_comments),
+        "multiline": list(multiline),   # (open, close, "comment"|"string")
+        "quotes": set(quotes),
+        "func_def": set(func_def.split()),
+        "class_kw": set(class_kw.split()),
+        "decorator": decorator,
+        "dollar_vars": dollar_vars,
+    }
+
+
+_BLOCK_C = ("/*", "*/", "comment")
+_TICK = ("`", "`", "string")
+
+LANGS = {
+    "python": _spec(
+        keywords="def lambda class global nonlocal del import from as with async await and or not in is self cls",
+        control="if elif else for while break continue return yield try except finally raise assert match case pass",
+        constants="True False None Ellipsis NotImplemented",
+        types="int float str bool list dict set tuple bytes object complex frozenset bytearray range",
+        line_comments=["#"],
+        multiline=[('"""', '"""', "string"), ("'''", "'''", "string")],
+        func_def="def", class_kw="class", decorator=True),
+    "javascript": _spec(
+        keywords="function var let const class extends implements new this super typeof instanceof in of delete "
+                 "void import export from default as async static get set public private protected readonly enum "
+                 "interface namespace type abstract declare",
+        control="if else for while do break continue return switch case try catch finally throw yield await",
+        constants="true false null undefined NaN Infinity",
+        types="string number boolean object symbol bigint any unknown never Array Object String Number Boolean "
+              "Promise Map Set Date RegExp Error JSON Math",
+        line_comments=["//"], multiline=[_BLOCK_C, _TICK],
+        func_def="function", class_kw="class extends implements new instanceof interface", decorator=True),
+    "java": _spec(
+        keywords="class interface enum extends implements new this super import package public private protected "
+                 "static final abstract synchronized volatile transient native instanceof var record sealed permits "
+                 "throws default assert",
+        control="if else for while do break continue return switch case try catch finally throw yield",
+        constants="true false null",
+        types="int long short byte char boolean float double void String Integer Long Double Float Boolean Object "
+              "List Map Set Optional Stream Exception",
+        line_comments=["//"], multiline=[_BLOCK_C],
+        class_kw="class interface enum extends implements new instanceof", decorator=True),
+    "php": _spec(
+        keywords="function fn class interface trait extends implements new clone instanceof public private protected "
+                 "static abstract final const var namespace use global echo print isset unset empty list array as "
+                 "enum readonly and or xor require require_once include include_once",
+        control="if elseif else for foreach while do break continue return switch case try catch finally throw yield match",
+        constants="true false null TRUE FALSE NULL",
+        types="int float string bool array object void mixed callable iterable self parent static",
+        line_comments=["//", "#"], multiline=[_BLOCK_C],
+        func_def="function fn", class_kw="class interface trait extends implements new instanceof",
+        dollar_vars=True),
+    "go": _spec(
+        keywords="func var const type struct interface map chan package import",
+        control="if else for range switch case break continue return select fallthrough goto defer go",
+        constants="true false nil iota",
+        types="int int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 float32 float64 string bool byte rune "
+              "error complex64 complex128 uintptr any",
+        line_comments=["//"], multiline=[_BLOCK_C, _TICK],
+        func_def="func", class_kw="type struct interface"),
+    "ruby": _spec(
+        keywords="def class module require require_relative include extend attr_accessor attr_reader attr_writer "
+                 "self super new lambda proc then and or not",
+        control="if elsif else unless end for while until do break next return begin rescue ensure raise case when yield",
+        constants="true false nil",
+        line_comments=["#"], func_def="def", class_kw="class module"),
+    "c": _spec(
+        keywords="int long short char float double void unsigned signed const static extern struct union enum "
+                 "typedef sizeof volatile register inline class public private protected virtual template typename "
+                 "namespace using new delete this operator friend explicit auto",
+        control="if else for while do break continue return switch case goto",
+        constants="true false NULL nullptr",
+        types="int char float double void bool size_t int8_t int16_t int32_t int64_t uint8_t uint32_t uint64_t wchar_t",
+        line_comments=["//"], multiline=[_BLOCK_C],
+        class_kw="class struct union enum new"),
+    "shell": _spec(
+        keywords="export local readonly declare function alias source set unset eval exec trap let",
+        control="if then elif else fi for while until do done case esac break continue return exit in",
+        constants="true false",
+        line_comments=["#"], func_def="function", dollar_vars=True),
 }
+LANGS["cpp"] = LANGS["c"]
 
 EXT_TO_LANG = {
-    ".py": "python", ".pyw": "python",
-    ".js": "javascript", ".jsx": "javascript", ".ts": "javascript", ".tsx": "javascript",
-    ".mjs": "javascript", ".json": "javascript", ".vue": "javascript",
-    ".php": "php",
-    ".sh": "shell", ".bash": "shell", ".zsh": "shell", ".env": "shell",
-    ".yml": "shell", ".yaml": "shell", ".conf": "shell", ".ini": "shell", ".toml": "shell",
-    ".rb": "ruby",
+    ".py": "python", ".pyw": "python", ".pyi": "python",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "javascript", ".tsx": "javascript", ".json": "javascript", ".vue": "javascript",
+    ".java": "java",
+    ".php": "php", ".phtml": "php",
     ".go": "go",
-    ".html": "javascript", ".css": "javascript", ".sql": "javascript",
+    ".rb": "ruby",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    ".sh": "shell", ".bash": "shell", ".zsh": "shell", ".env": "shell",
 }
 
 
@@ -112,35 +179,152 @@ def lang_for_path(path: str) -> str | None:
 
 
 class Highlighter(QSyntaxHighlighter):
+    """Tokenizador con contexto y estado por bloque (para multilínea)."""
+
     def __init__(self, document, lang: str | None):
         super().__init__(document)
-        self.rules: list[tuple[re.Pattern, QTextCharFormat]] = []
-        self.comment_token = None
-        if not lang or lang not in LANG_KEYWORDS:
-            return
-        spec = LANG_KEYWORDS[lang]
-        kw = spec["keywords"].split()
-        ctrl = spec["control"].split()
-        self.rules.append((re.compile(r"\b(" + "|".join(kw) + r")\b"), _fmt(C_KEYWORD)))
-        self.rules.append((re.compile(r"\b(" + "|".join(ctrl) + r")\b"), _fmt(C_CONTROL)))
-        self.rules.append((re.compile(r"\b[A-Z][A-Za-z0-9_]*\b"), _fmt(C_TYPE)))
-        self.rules.append((re.compile(r"\b\w+(?=\s*\()"), _fmt(C_FUNC)))
-        self.rules.append((re.compile(r"\b\d+(\.\d+)?\b"), _fmt(C_NUMBER)))
-        if "decorator" in spec:
-            self.rules.append((re.compile(spec["decorator"]), _fmt(C_DECOR)))
-        # cadenas (después, para que pisen a lo anterior)
-        self.rules.append((re.compile(r"'[^'\n]*'|\"[^\"\n]*\"|`[^`\n]*`"), _fmt(C_STRING)))
-        self.comment_token = spec.get("comment")
-        self.comment_fmt = _fmt(C_COMMENT, italic=True)
+        self.spec = LANGS.get(lang or "")
+        self.fmt = {
+            "keyword": _fmt(C_KEYWORD),
+            "control": _fmt(C_CONTROL),
+            "string": _fmt(C_STRING),
+            "comment": _fmt(C_COMMENT, italic=True),
+            "number": _fmt(C_NUMBER),
+            "function": _fmt(C_FUNC),
+            "type": _fmt(C_TYPE),
+            "constant": _fmt(C_CONST),
+            "decorator": _fmt(C_DECOR),
+            "variable": _fmt(C_VAR),
+        }
+        lc = self.spec["line_comments"] if self.spec else []
+        self.comment_token = lc[0] if lc else None
 
     def highlightBlock(self, text: str):
-        for pattern, fmt in self.rules:
-            for m in pattern.finditer(text):
-                self.setFormat(m.start(), m.end() - m.start(), fmt)
-        if self.comment_token:
-            idx = text.find(self.comment_token)
-            if idx >= 0:
-                self.setFormat(idx, len(text) - idx, self.comment_fmt)
+        if not self.spec:
+            return
+        self.setCurrentBlockState(0)
+        ml = self.spec["multiline"]
+        start = 0
+        prev = self.previousBlockState()
+        if 0 < prev <= len(ml):
+            op, cl, kind = ml[prev - 1]
+            end = text.find(cl)
+            if end == -1:
+                self.setFormat(0, len(text), self.fmt[kind])
+                self.setCurrentBlockState(prev)
+                return
+            self.setFormat(0, end + len(cl), self.fmt[kind])
+            start = end + len(cl)
+        self._scan(text, start)
+
+    def _scan(self, text: str, i: int):
+        spec, fmt, n = self.spec, self.fmt, len(text)
+        quotes = spec["quotes"]
+        line_comments = spec["line_comments"]
+        multiline = spec["multiline"]
+        while i < n:
+            c = text[i]
+            # comentario de línea
+            if any(text.startswith(lc, i) for lc in line_comments):
+                self.setFormat(i, n - i, fmt["comment"])
+                return
+            # apertura de bloque multilínea (comentario o cadena)
+            ml_done = False
+            for idx, (op, cl, kind) in enumerate(multiline):
+                if text.startswith(op, i):
+                    close_at = text.find(cl, i + len(op))
+                    if close_at == -1:
+                        self.setFormat(i, n - i, fmt[kind])
+                        self.setCurrentBlockState(idx + 1)
+                        return
+                    self.setFormat(i, close_at + len(cl) - i, fmt[kind])
+                    i = close_at + len(cl)
+                    ml_done = True
+                    break
+            if ml_done:
+                continue
+            # cadena de una línea
+            if c in quotes:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == c:
+                        j += 1
+                        break
+                    j += 1
+                self.setFormat(i, j - i, fmt["string"])
+                i = j
+                continue
+            # número
+            if c.isdigit() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                m = _NUM_RE.match(text, i)
+                if m:
+                    self.setFormat(i, m.end() - i, fmt["number"])
+                    i = m.end()
+                    continue
+            # palabra (identificador, palabra clave, decorador, variable…)
+            if c.isalpha() or c == "_" or c == "@" or (c == "$" and spec["dollar_vars"]):
+                m = _WORD_RE.match(text, i)
+                if m:
+                    self._classify(text, i, m.end(), m.group())
+                    i = m.end()
+                    continue
+            i += 1
+
+    def _classify(self, text: str, i: int, end: int, word: str):
+        spec, fmt = self.spec, self.fmt
+        if word[0] == "@":
+            if spec["decorator"]:
+                self.setFormat(i, end - i, fmt["decorator"])
+            return
+        if word[0] == "$":
+            self.setFormat(i, end - i, fmt["variable"])
+            return
+        if word in spec["control"]:
+            self.setFormat(i, end - i, fmt["control"])
+            return
+        if word in spec["keywords"]:
+            self.setFormat(i, end - i, fmt["keyword"])
+            return
+        if word in spec["constants"]:
+            self.setFormat(i, end - i, fmt["constant"])
+            return
+        if word in spec["types"]:
+            self.setFormat(i, end - i, fmt["type"])
+            return
+        prev = self._prev_word(text, i)
+        if prev in spec["func_def"]:
+            self.setFormat(i, end - i, fmt["function"])
+            return
+        if prev in spec["class_kw"]:
+            self.setFormat(i, end - i, fmt["type"])
+            return
+        if self._next_nonspace(text, end) == "(":
+            self.setFormat(i, end - i, fmt["function"])
+            return
+        if word[0].isupper():   # ClassName / Tipo (heurística)
+            self.setFormat(i, end - i, fmt["type"])
+            return
+        # resto: variable/identificador → color de texto por defecto
+
+    @staticmethod
+    def _prev_word(text: str, i: int) -> str:
+        j = i - 1
+        while j >= 0 and text[j].isspace():
+            j -= 1
+        end = j + 1
+        while j >= 0 and (text[j].isalnum() or text[j] == "_"):
+            j -= 1
+        return text[j + 1:end]
+
+    @staticmethod
+    def _next_nonspace(text: str, end: int) -> str:
+        j = end
+        while j < len(text) and text[j].isspace():
+            j += 1
+        return text[j] if j < len(text) else ""
 
 
 # ---------------------------------------------------------------- editor
@@ -260,10 +444,12 @@ class CodeEditor(QPlainTextEdit):
 
     @staticmethod
     def _build_lang_words(lang: str | None) -> set[str]:
-        spec = LANG_KEYWORDS.get(lang or "", {})
+        spec = LANGS.get(lang or "")
+        if not spec:
+            return set()
         words: set[str] = set()
-        for key in ("keywords", "control"):
-            words.update(spec.get(key, "").split())
+        for key in ("keywords", "control", "constants", "types"):
+            words.update(spec[key])
         return words
 
     # --- revisión de cambios de Claude ---
