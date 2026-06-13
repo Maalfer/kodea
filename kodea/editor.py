@@ -184,6 +184,7 @@ class Highlighter(QSyntaxHighlighter):
 
     def __init__(self, document, lang: str | None):
         super().__init__(document)
+        self.lang = lang
         self.spec = LANGS.get(lang or "")
         self.fmt = {
             "keyword": _fmt(C_KEYWORD),
@@ -246,17 +247,7 @@ class Highlighter(QSyntaxHighlighter):
                 continue
             # cadena de una línea
             if c in quotes:
-                j = i + 1
-                while j < n:
-                    if text[j] == "\\":
-                        j += 2
-                        continue
-                    if text[j] == c:
-                        j += 1
-                        break
-                    j += 1
-                self.setFormat(i, j - i, fmt["string"])
-                i = j
+                i = self._scan_string(text, i, c, allow_interp=False)
                 continue
             # número
             if c.isdigit() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
@@ -267,6 +258,85 @@ class Highlighter(QSyntaxHighlighter):
                     continue
             # palabra (identificador, palabra clave, decorador, variable…)
             if c.isalpha() or c == "_" or c == "@" or (c == "$" and spec["dollar_vars"]):
+                m = _WORD_RE.match(text, i)
+                if m:
+                    end = m.end()
+                    word = m.group()
+                    nxt = text[end:end + 1]
+                    # prefijo de cadena de Python: f"…", r'…', rb"…", f-string…
+                    if (self.lang == "python" and nxt in quotes
+                            and text[end:end + 3] != nxt * 3
+                            and self._is_string_prefix(word)):
+                        self.setFormat(i, end - i, fmt["string"])
+                        i = self._scan_string(text, end, nxt,
+                                              allow_interp="f" in word.lower())
+                        continue
+                    self._classify(text, i, end, word)
+                    i = end
+                    continue
+            i += 1
+
+    @staticmethod
+    def _is_string_prefix(word: str) -> bool:
+        return len(word) <= 2 and all(ch in "frbuFRBU" for ch in word)
+
+    def _scan_string(self, text: str, i: int, quote: str, allow_interp: bool) -> int:
+        """Colorea una cadena de una línea desde la comilla en `i`. Si
+        `allow_interp`, los tramos {…} (f-strings) se tokenizan como código."""
+        n = len(text)
+        seg = i           # inicio del tramo de cadena sin pintar
+        j = i + 1
+        while j < n:
+            ch = text[j]
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                j += 1
+                self.setFormat(seg, j - seg, self.fmt["string"])
+                return j
+            if allow_interp and ch == "{":
+                if text[j + 1:j + 2] == "{":     # '{{' literal
+                    j += 2
+                    continue
+                self.setFormat(seg, j - seg, self.fmt["string"])
+                close = self._brace_end(text, j)
+                self._scan_code_range(text, j + 1, close)
+                j = close + 1
+                seg = j
+                continue
+            j += 1
+        self.setFormat(seg, n - seg, self.fmt["string"])
+        return n
+
+    @staticmethod
+    def _brace_end(text: str, j: int) -> int:
+        depth, n = 0, len(text)
+        while j < n:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return j
+            j += 1
+        return n - 1
+
+    def _scan_code_range(self, text: str, i: int, end: int):
+        """Tokeniza el interior de una interpolación como código."""
+        quotes = self.spec["quotes"]
+        while i < end:
+            c = text[i]
+            if c in quotes:
+                i = self._scan_string(text, i, c, allow_interp=False)
+                continue
+            if c.isdigit() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                m = _NUM_RE.match(text, i)
+                if m and m.end() <= end:
+                    self.setFormat(i, m.end() - i, self.fmt["number"])
+                    i = m.end()
+                    continue
+            if c.isalpha() or c == "_" or (c == "$" and self.spec["dollar_vars"]):
                 m = _WORD_RE.match(text, i)
                 if m:
                     self._classify(text, i, m.end(), m.group())
@@ -305,10 +375,11 @@ class Highlighter(QSyntaxHighlighter):
         if self._next_nonspace(text, end) == "(":
             self.setFormat(i, end - i, fmt["function"])
             return
-        if word[0].isupper():   # ClassName / Tipo (heurística)
-            self.setFormat(i, end - i, fmt["type"])
+        if word[0].isupper() and any(ch.islower() for ch in word):
+            self.setFormat(i, end - i, fmt["type"])   # PascalCase → clase/tipo
             return
-        # resto: variable/identificador → color de texto por defecto
+        # resto: variable / parámetro / propiedad / constante → celeste
+        self.setFormat(i, end - i, fmt["variable"])
 
     @staticmethod
     def _prev_word(text: str, i: int) -> str:
